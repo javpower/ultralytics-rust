@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+runs/
+*.pt
+*.onnx
+*.engine
+__pycache__/
+.env
+scripts/env.local.sh
