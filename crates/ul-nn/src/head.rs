@@ -188,22 +188,24 @@ impl DetectHead {
         let mut cv2 = Vec::new();
         let mut cv3 = Vec::new();
         for (i, &x) in ch.iter().enumerate() {
-            let pi = p.idx(i as usize);
-            cv2.push(Branch::init(&pi.child("cv2"), x, c2, reg_max * 4, true));
+            // 官方命名：cv2/cv3 是 ModuleList，level 索引在分支名之后
+            let cv2p = p.child("cv2").idx(i as usize);
+            let cv3p = p.child("cv3").idx(i as usize);
+            cv2.push(Branch::init(&cv2p, x, c2, reg_max * 4, true));
             let c3i = if light_cls { x } else { c3 };
             cv3.push(if light_cls {
                 // v10 轻量 cls：Sequential((Conv g=x 3x3, Conv 1x1), (Conv g=c3, Conv 1x1), 1x1)
                 let s0 = BranchStage::Pair(
-                    Conv::init(&pi.child("cv3").idx(0).idx(0), x, x, 3, 1, None, x, 1, true),
-                    Conv::init(&pi.child("cv3").idx(0).idx(1), x, c3i, 1, 1, None, 1, 1, true),
+                    Conv::init(&cv3p.idx(0).idx(0), x, x, 3, 1, None, x, 1, true),
+                    Conv::init(&cv3p.idx(0).idx(1), x, c3i, 1, 1, None, 1, 1, true),
                 );
                 let s1 = BranchStage::Pair(
-                    Conv::init(&pi.child("cv3").idx(1).idx(0), c3i, c3i, 3, 1, None, c3i, 1, true),
-                    Conv::init(&pi.child("cv3").idx(1).idx(1), c3i, c3i, 1, 1, None, 1, 1, true),
+                    Conv::init(&cv3p.idx(1).idx(0), c3i, c3i, 3, 1, None, c3i, 1, true),
+                    Conv::init(&cv3p.idx(1).idx(1), c3i, c3i, 1, 1, None, 1, 1, true),
                 );
-                Branch { stage0: s0, stage1: s1, final_conv: RawOut::init(&pi.child("cv3").idx(2), c3i, nc) }
+                Branch { stage0: s0, stage1: s1, final_conv: RawOut::init(&cv3p.idx(2), c3i, nc) }
             } else {
-                Branch::init(&pi.child("cv3"), x, c3, nc, legacy)
+                Branch::init(&cv3p, x, c3, nc, legacy)
             });
         }
         // 附加分支
@@ -214,14 +216,14 @@ impl DetectHead {
             ExtraKind::Mask => {
                 let c4 = (ch[0] / 4).max(nm);
                 for (i, &x) in ch.iter().enumerate() {
-                    cv4.push(Branch::init(&p.idx(i as usize).child("cv4"), x, c4, nm, true));
+                    cv4.push(Branch::init(&p.child("cv4").idx(i as usize), x, c4, nm, true));
                 }
             }
             ExtraKind::Kpt => {
                 let nk = kpt_shape.0 * kpt_shape.1;
                 let c4 = (ch[0] / 4).max(nk);
                 for (i, &x) in ch.iter().enumerate() {
-                    cv4.push(Branch::init(&p.idx(i as usize).child("cv4"), x, c4, nk, true));
+                    cv4.push(Branch::init(&p.child("cv4").idx(i as usize), x, c4, nk, true));
                 }
             }
             ExtraKind::Kpt26 => {
@@ -229,25 +231,25 @@ impl DetectHead {
                 let nk_sigma = kpt_shape.0 * 2;
                 let c4 = (ch[0] / 4).max(kpt_shape.0 * (kpt_shape.1 + 2));
                 for (i, &x) in ch.iter().enumerate() {
-                    let pi = p.idx(i as usize);
                     // cv4 = Sequential(Conv, Conv)（两段，无 1x1 收尾）
+                    let cv4p = p.child("cv4").idx(i as usize);
                     cv4_pair.push((
-                        Conv::init(&pi.child("cv4").idx(0), x, c4, 3, 1, None, 1, 1, true),
-                        Conv::init(&pi.child("cv4").idx(1), c4, c4, 3, 1, None, 1, 1, true),
+                        Conv::init(&cv4p.idx(0), x, c4, 3, 1, None, 1, 1, true),
+                        Conv::init(&cv4p.idx(1), c4, c4, 3, 1, None, 1, 1, true),
                     ));
-                    cv4_kpts.push(RawOut::init(&pi.child("cv4_kpts").idx(i as usize), c4, nk));
-                    cv4_sigma.push(RawOut::init(&pi.child("cv4_sigma").idx(i as usize), c4, nk_sigma));
+                    cv4_kpts.push(RawOut::init(&p.child("cv4_kpts").idx(i as usize), c4, nk));
+                    cv4_sigma.push(RawOut::init(&p.child("cv4_sigma").idx(i as usize), c4, nk_sigma));
                 }
             }
             ExtraKind::Angle | ExtraKind::Angle26 => {
                 let c4 = (ch[0] / 4).max(ne);
                 for (i, &x) in ch.iter().enumerate() {
-                    cv4.push(Branch::init(&p.idx(i as usize).child("cv4"), x, c4, ne, true));
+                    cv4.push(Branch::init(&p.child("cv4").idx(i as usize), x, c4, ne, true));
                 }
             }
         }
         let _ = &mut cv4_pair;
-        let dfl = if reg_max > 1 { Some(Dfl::new(p, reg_max)) } else { None };
+        let dfl = if reg_max > 1 { Some(Dfl::new(&p.child("dfl"), reg_max)) } else { None };
         DetectHead {
             nc,
             nl,
@@ -292,34 +294,36 @@ impl DetectHead {
         let mut cv4_kpts = Vec::new();
         let mut cv4_sigma = Vec::new();
         for (i, &x) in ch.iter().enumerate() {
-            let pi = p.idx(i as usize);
-            cv2.push(Branch::init(&pi.child("one2one_cv2"), x, c2, self.reg_max * 4, true));
-            cv3.push(Branch::init(&pi.child("one2one_cv3"), x, c3, self.nc, self.legacy));
+            let cv2p = p.child("one2one_cv2").idx(i as usize);
+            let cv3p = p.child("one2one_cv3").idx(i as usize);
+            cv2.push(Branch::init(&cv2p, x, c2, self.reg_max * 4, true));
+            cv3.push(Branch::init(&cv3p, x, c3, self.nc, self.legacy));
             match self.kind {
                 ExtraKind::None => {}
                 ExtraKind::Mask => {
                     let c4 = (ch[0] / 4).max(self.nm);
-                    cv4.push(Branch::init(&pi.child("one2one_cv4"), x, c4, self.nm, true));
+                    cv4.push(Branch::init(&p.child("one2one_cv4").idx(i as usize), x, c4, self.nm, true));
                 }
                 ExtraKind::Kpt => {
                     let nk = self.kpt_shape.0 * self.kpt_shape.1;
                     let c4 = (ch[0] / 4).max(nk);
-                    cv4.push(Branch::init(&pi.child("one2one_cv4"), x, c4, nk, true));
+                    cv4.push(Branch::init(&p.child("one2one_cv4").idx(i as usize), x, c4, nk, true));
                 }
                 ExtraKind::Kpt26 => {
                     let nk = self.kpt_shape.0 * self.kpt_shape.1;
                     let nk_sigma = self.kpt_shape.0 * 2;
                     let c4 = (ch[0] / 4).max(self.kpt_shape.0 * (self.kpt_shape.1 + 2));
+                    let cv4p = p.child("one2one_cv4").idx(i as usize);
                     cv4_pair.push((
-                        Conv::init(&pi.child("one2one_cv4").idx(0), x, c4, 3, 1, None, 1, 1, true),
-                        Conv::init(&pi.child("one2one_cv4").idx(1), c4, c4, 3, 1, None, 1, 1, true),
+                        Conv::init(&cv4p.idx(0), x, c4, 3, 1, None, 1, 1, true),
+                        Conv::init(&cv4p.idx(1), c4, c4, 3, 1, None, 1, 1, true),
                     ));
-                    cv4_kpts.push(RawOut::init(&pi.child("one2one_cv4_kpts").idx(i as usize), c4, nk));
-                    cv4_sigma.push(RawOut::init(&pi.child("one2one_cv4_sigma").idx(i as usize), c4, nk_sigma));
+                    cv4_kpts.push(RawOut::init(&p.child("one2one_cv4_kpts").idx(i as usize), c4, nk));
+                    cv4_sigma.push(RawOut::init(&p.child("one2one_cv4_sigma").idx(i as usize), c4, nk_sigma));
                 }
                 ExtraKind::Angle | ExtraKind::Angle26 => {
                     let c4 = (ch[0] / 4).max(self.ne);
-                    cv4.push(Branch::init(&pi.child("one2one_cv4"), x, c4, self.ne, true));
+                    cv4.push(Branch::init(&p.child("one2one_cv4").idx(i as usize), x, c4, self.ne, true));
                 }
             }
         }

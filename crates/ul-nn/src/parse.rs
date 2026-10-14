@@ -382,12 +382,12 @@ pub fn parse_model(
             }
             "C2fPSA" => {
                 let (c1, c2m) = (ch_f(f[0])?, scaled(&args[0], width, max_channels));
-                let e = arg_f(args, 3, 0.5);
+                let e = arg_f(args, 1, 0.5);
                 (Module::C2fPsa(C2fPsa::init(&root.child(&fmt(i)), c1, c2m, n_, e)), c2m, "models.yolo.block.C2fPSA".into())
             }
             "C2PSA" => {
                 let (c1, c2m) = (ch_f(f[0])?, scaled(&args[0], width, max_channels));
-                let e = arg_f(args, 3, 0.5);
+                let e = arg_f(args, 1, 0.5);
                 (Module::C2Psa(C2Psa::init(&root.child(&fmt(i)), c1, c2m, n_, e)), c2m, "models.yolo.block.C2PSA".into())
             }
             "PSA" => {

@@ -137,29 +137,27 @@ pub struct C3 {
     pub cv1: Conv,
     pub cv2: Conv,
     pub cv3: Conv,
-    pub m: Bottleneck,
-    /// Sequential 重复次数（权重名共享 m，前向循环 n 次）。
-    pub repeat: i64,
+    /// Sequential(Bottleneck × n)：每块独立参数 m.0..m.n-1。
+    pub m: Vec<Bottleneck>,
 }
 
 impl C3 {
     /// `k=(1,3)` 标准 C3；`k=(1,3)` 交叉即 C3x 亦同形（C3x 用 (1,3)？官方 C3x 用 k=((1,3),(3,1))）。
     pub fn init(p: &VarPath, c1: i64, c2: i64, n: i64, shortcut: bool, g: i64, e: f64, k: (i64, i64)) -> Self {
         let c_ = (c2 as f64 * e) as i64;
-        let m = Bottleneck::init(&p.child("m").idx(0), c_, c_, shortcut, g, k, 1.0);
+        let mp = p.child("m");
         C3 {
             cv1: Conv::init(&p.child("cv1"), c1, c_, 1, 1, None, 1, 1, true),
             cv2: Conv::init(&p.child("cv2"), c1, c_, 1, 1, None, 1, 1, true),
             cv3: Conv::init(&p.child("cv3"), 2 * c_, c2, 1, 1, None, 1, 1, true),
-            m,
-            repeat: n,
+            m: (0..n).map(|i| Bottleneck::init(&mp.idx(i as usize), c_, c_, shortcut, g, k, 1.0)).collect(),
         }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         let mut y = self.cv1.forward(x, train);
-        for _ in 0..self.repeat {
-            y = self.m.forward(&y, train);
+        for b in &self.m {
+            y = b.forward(&y, train);
         }
         let y2 = self.cv2.forward(x, train);
         self.cv3.forward(&Tensor::cat(&[&y, &y2], 1), train)
@@ -241,7 +239,8 @@ impl C3k2 {
             } else if c3k {
                 InnerBlock::C3k(C3k::init(&pi, c_, c_, 2, shortcut, g, 0.5, 3))
             } else {
-                InnerBlock::Bottleneck(Bottleneck::init(&pi, c_, c_, shortcut, g, (3, 3), 1.0))
+                // 官方 C3k2：Bottleneck(self.c, self.c, shortcut, g) —— e 用默认 0.5
+                InnerBlock::Bottleneck(Bottleneck::init(&pi, c_, c_, shortcut, g, (3, 3), 0.5))
             };
             out.base.m.push(blk);
         }
@@ -685,24 +684,23 @@ impl C2fCib {
 /// C1：单卷积 + 3x3 串。
 pub struct C1 {
     pub cv1: Conv,
-    pub m: Conv,
-    pub repeat: i64,
+    pub m: Vec<Conv>,
 }
 
 impl C1 {
     pub fn init(p: &VarPath, c1: i64, c2: i64, n: i64) -> Self {
+        let mp = p.child("m");
         C1 {
             cv1: Conv::init(&p.child("cv1"), c1, c2, 1, 1, None, 1, 1, true),
-            m: Conv::init(&p.child("m").idx(0), c2, c2, 3, 1, None, 1, 1, true),
-            repeat: n,
+            m: (0..n).map(|i| Conv::init(&mp.idx(i as usize), c2, c2, 3, 1, None, 1, 1, true)).collect(),
         }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         let y = self.cv1.forward(x, train);
         let mut y = y.shallow_clone();
-        for _ in 0..self.repeat {
-            y = self.m.forward(&y, train);
+        for c in &self.m {
+            y = c.forward(&y, train);
         }
         y + self.cv1.forward(x, train)
     }
@@ -713,27 +711,26 @@ pub struct C2 {
     pub c: i64,
     pub cv1: Conv,
     pub cv2: Conv,
-    pub m: Bottleneck,
-    pub repeat: i64,
+    pub m: Vec<Bottleneck>,
 }
 
 impl C2 {
     pub fn init(p: &VarPath, c1: i64, c2: i64, n: i64, shortcut: bool, g: i64, e: f64) -> Self {
         let c_ = (c2 as f64 * e) as i64;
+        let mp = p.child("m");
         C2 {
             c: c_,
             cv1: Conv::init(&p.child("cv1"), c1, 2 * c_, 1, 1, None, 1, 1, true),
             cv2: Conv::init(&p.child("cv2"), 2 * c_, c2, 1, 1, None, 1, 1, true),
-            m: Bottleneck::init(&p.child("m").idx(0), c_, c_, shortcut, g, (3, 3), 1.0),
-            repeat: n,
+            m: (0..n).map(|i| Bottleneck::init(&mp.idx(i as usize), c_, c_, shortcut, g, (3, 3), 1.0)).collect(),
         }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         let halves = self.cv1.forward(x, train).chunk(2, 1);
         let mut a = halves[0].shallow_clone();
-        for _ in 0..self.repeat {
-            a = self.m.forward(&a, train);
+        for b in &self.m {
+            a = b.forward(&a, train);
         }
         self.cv2.forward(&Tensor::cat(&[a, halves[1].shallow_clone()], 1), train)
     }
@@ -797,26 +794,25 @@ pub struct C3Ghost {
     pub cv1: Conv,
     pub cv2: Conv,
     pub cv3: Conv,
-    pub m: GhostBottleneck,
-    pub repeat: i64,
+    pub m: Vec<GhostBottleneck>,
 }
 
 impl C3Ghost {
     pub fn init(p: &VarPath, c1: i64, c2: i64, n: i64, e: f64) -> Self {
         let c_ = (c2 as f64 * e) as i64;
+        let mp = p.child("m");
         C3Ghost {
             cv1: Conv::init(&p.child("cv1"), c1, c_, 1, 1, None, 1, 1, true),
             cv2: Conv::init(&p.child("cv2"), c1, c_, 1, 1, None, 1, 1, true),
             cv3: Conv::init(&p.child("cv3"), 2 * c_, c2, 1, 1, None, 1, 1, true),
-            m: GhostBottleneck::init(&p.child("m").idx(0), c_, c_, 3, 1),
-            repeat: n,
+            m: (0..n).map(|i| GhostBottleneck::init(&mp.idx(i as usize), c_, c_, 3, 1)).collect(),
         }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         let mut y = self.cv1.forward(x, train);
-        for _ in 0..self.repeat {
-            y = self.m.forward(&y, train);
+        for b in &self.m {
+            y = b.forward(&y, train);
         }
         let y2 = self.cv2.forward(x, train);
         self.cv3.forward(&Tensor::cat(&[&y, &y2], 1), train)
@@ -830,8 +826,7 @@ pub struct BottleneckCsp {
     pub cv3: RawConv,
     pub cv4: Conv,
     pub bn: BatchNorm,
-    pub m: Bottleneck,
-    pub repeat: i64,
+    pub m: Vec<Bottleneck>,
     pub c_: i64,
 }
 
@@ -848,15 +843,17 @@ impl BottleneckCsp {
             cv3: RawConv { weight: cv3_w, bias: None, stride: 1, padding: 0, pad_h: 0, pad_w: 0, dilation: 1, groups: 1 },
             cv4: Conv::init(&p.child("cv4"), 2 * c_, c2, 1, 1, None, 1, 1, true),
             bn: BatchNorm::init(p, 2 * c_),
-            m: Bottleneck::init(&p.child("m").idx(0), c_, c_, shortcut, g, (3, 3), 1.0),
-            repeat: n,
+            m: {
+                let mp = p.child("m");
+                (0..n).map(|i| Bottleneck::init(&mp.idx(i as usize), c_, c_, shortcut, g, (3, 3), 1.0)).collect()
+            },
         }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         let mut y1 = self.cv1.forward(x, train);
-        for _ in 0..self.repeat {
-            y1 = self.m.forward(&y1, train);
+        for b in &self.m {
+            y1 = b.forward(&y1, train);
         }
         let y1 = self.cv3.forward(&y1);
         let y2 = self.cv2.forward(x);
@@ -1062,8 +1059,7 @@ pub struct C3x {
     pub cv1: Conv,
     pub cv2: Conv,
     pub cv3: Conv,
-    pub m: BottleneckRect,
-    pub repeat: i64,
+    pub m: Vec<BottleneckRect>,
 }
 
 /// 非对称 kernel bottleneck（C3x 内部）。
@@ -1094,20 +1090,19 @@ impl BottleneckRect {
 impl C3x {
     pub fn init(p: &VarPath, c1: i64, c2: i64, n: i64, shortcut: bool, g: i64, e: f64) -> Self {
         let c_ = (c2 as f64 * e) as i64;
-        let m = BottleneckRect::init(&p.child("m").idx(0), c_, c_, shortcut, g);
+        let mp = p.child("m");
         C3x {
             cv1: Conv::init(&p.child("cv1"), c1, c_, 1, 1, None, 1, 1, true),
             cv2: Conv::init(&p.child("cv2"), c1, c_, 1, 1, None, 1, 1, true),
             cv3: Conv::init(&p.child("cv3"), 2 * c_, c2, 1, 1, None, 1, 1, true),
-            m,
-            repeat: n,
+            m: (0..n).map(|i| BottleneckRect::init(&mp.idx(i as usize), c_, c_, shortcut, g)).collect(),
         }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> Tensor {
         let mut y = self.cv1.forward(x, train);
-        for _ in 0..self.repeat {
-            y = self.m.forward(&y, train);
+        for b in &self.m {
+            y = b.forward(&y, train);
         }
         let y2 = self.cv2.forward(x, train);
         self.cv3.forward(&Tensor::cat(&[y, y2], 1), train)

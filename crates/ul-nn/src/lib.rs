@@ -8,6 +8,7 @@ pub mod model;
 pub mod module;
 pub mod ops;
 pub mod parse;
+pub mod pt;
 pub mod special;
 pub mod tal;
 

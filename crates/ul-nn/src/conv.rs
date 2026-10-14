@@ -79,8 +79,8 @@ impl RawConv {
     pub fn init(p: &VarPath, c1: i64, c2: i64, k: i64, bias: bool, groups: i64) -> Self {
         let fan_in = c1 * k * k / groups.max(1);
         let bound = (1.0 / fan_in as f64).sqrt();
-        let weight = p.var_conv_weight("conv.weight", c2, c1 / groups.max(1), k, bound);
-        let bias = if bias { Some(p.var_1d("conv.bias", c2, Init::UniformSigned(1.0 / (fan_in as f64).sqrt()))) } else { None };
+        let weight = p.var_conv_weight("weight", c2, c1 / groups.max(1), k, bound);
+        let bias = if bias { Some(p.var_1d("bias", c2, Init::UniformSigned(1.0 / (fan_in as f64).sqrt()))) } else { None };
         RawConv { weight, bias, stride: 1, padding: 0, pad_h: 0, pad_w: 0, dilation: 1, groups }
     }
 

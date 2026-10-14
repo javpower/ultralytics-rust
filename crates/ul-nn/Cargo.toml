@@ -19,3 +19,6 @@ log = { workspace = true }
 regex = { workspace = true }
 rand = { workspace = true }
 num_cpus = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
