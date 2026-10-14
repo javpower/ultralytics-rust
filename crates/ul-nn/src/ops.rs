@@ -40,7 +40,7 @@ pub fn dist2bbox(distance: &Tensor, anchor_points: &Tensor, xywh: bool, dim: i64
     let x2y2 = anchor_points.unsqueeze(0) + rb;
     if xywh {
         let cxy = (&x1y1 + &x2y2) / 2.0;
-        let wh = (&x2y2 - &x1y1) / 2.0;
+        let wh = &x2y2 - &x1y1; // 官方不除 2（ltrb 是到锚点的两边距离和=宽高）
         Tensor::cat(&[cxy, wh], dim)
     } else {
         Tensor::cat(&[x1y1, x2y2], dim)
@@ -108,6 +108,44 @@ pub fn bbox_iou(box1: &Tensor, box2: &Tensor, giou: bool, diou: bool, ciou: bool
             iou = &iou - (&v * alpha);
         }
     }
+    iou
+}
+
+/// 成对 IoU：box1 (N,4) vs box2 (N,4) → (N,1)（tal.py bbox_iou 语义）。
+pub fn bbox_iou_pairwise(box1: &Tensor, box2: &Tensor, ciou: bool) -> Tensor {
+    let iou = bbox_iou(box1, box2, false, false, ciou, 1e-7);
+    iou.diag(0).unsqueeze(1)
+}
+
+/// 批量 CIoU：gt (bs, m, 4) × pd (bs, A, 4) → (bs, m, A)（TAL 用）。
+pub fn bbox_iou_ciou_batched(gt: &Tensor, pd: &Tensor, eps: f64) -> Tensor {
+    let a = gt.unsqueeze(2); // (bs, m, 1, 4)
+    let b = pd.unsqueeze(1); // (bs, 1, A, 4)
+    let a_parts = a.split_with_sizes(&[2, 2], 3);
+    let b_parts = b.split_with_sizes(&[2, 2], 3);
+    let (a1, a2) = (&a_parts[0], &a_parts[1]);
+    let (b1, b2) = (&b_parts[0], &b_parts[1]);
+    let inter = (a2.minimum(b2) - a1.maximum(b1)).clamp_min(0.0);
+    let inter = inter.select(3, 0) * inter.select(3, 1);
+    let wh_a = a2 - a1;
+    let wh_b = b2 - b1;
+    let area_a = wh_a.select(3, 0) * wh_a.select(3, 1);
+    let area_b = wh_b.select(3, 0) * wh_b.select(3, 1);
+    let union = &area_a + &area_b - &inter + eps;
+    let mut iou = &inter / &union;
+    // CIoU
+    let cw = a2.maximum(b2) - a1.minimum(b1);
+    let c_area = cw.select(3, 0) * cw.select(3, 1) + eps;
+    let d = b1 + b2 - a1 - a2;
+    let rho2 = (d.select(3, 0) * d.select(3, 0)) + (d.select(3, 1) * d.select(3, 1));
+    iou = &iou - rho2 / c_area;
+    let w1 = wh_a.select(3, 0).unsqueeze(2); // (bs, m, 1)
+    let h1 = wh_a.select(3, 1).unsqueeze(2);
+    let w2 = wh_b.select(3, 0).unsqueeze(1); // (bs, 1, A)
+    let h2 = wh_b.select(3, 1).unsqueeze(1);
+    let v = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0) * (4.0 / std::f64::consts::PI.powi(2));
+    let alpha = &v / ((1 - &iou) + &v);
+    iou = &iou - (v * alpha);
     iou
 }
 

@@ -6,6 +6,7 @@ pub mod conv;
 pub mod head;
 pub mod model;
 pub mod module;
+pub mod onnx;
 pub mod ops;
 pub mod parse;
 pub mod pt;
