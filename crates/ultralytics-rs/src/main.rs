@@ -81,7 +81,12 @@ fn main() -> anyhow::Result<()> {
     match args.mode.as_str() {
         "train" => {
             let data = get("data").ok_or_else(|| anyhow::anyhow!("data= required"))?;
-            let data_path = find_cfg_path(&data);
+            // classify：data 为目录布局根，不做 yaml 解析
+            let data_path = if args.task == "classify" || args.task == "cls" {
+                PathBuf::from(&data)
+            } else {
+                find_cfg_path(&data)
+            };
             // 增强超参透传（default.yaml Hyperparameters 段；未指定的键取官方默认值）
             let mut augment = ul_data::augment::AugmentCfg::default();
             augment.hsv_h = getf("hsv_h", augment.hsv_h);
@@ -126,7 +131,14 @@ fn main() -> anyhow::Result<()> {
                 patience: geti("patience", 100) as usize,
                 pretrained: get("pretrained").map(PathBuf::from),
             };
-            let nc_from_data = infer_nc(&data_path)?;
+            // classify：nc = 子目录数（DOTA/COCO 风格目录布局）
+            let nc_from_data = if args.task == "classify" || args.task == "cls" {
+                std::fs::read_dir(&data_path)
+                    .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count() as i64)
+                    .unwrap_or(80)
+            } else {
+                infer_nc(&data_path)?
+            };
             let mut model = if model_name.ends_with(".pt") && Path::new(&model_name).exists() {
                 let (sd, _) = ul_nn::pt::load_pt(Path::new(&model_name))?;
                 let stem = Path::new(&model_name)

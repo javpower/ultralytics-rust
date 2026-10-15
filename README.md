@@ -137,6 +137,7 @@ CUDA：libtorch CUDA 版即可（`tch` 运行时探测），无卡自动回退 C
 - **任务面**：detect/classify/segment/pose/obb 训练+评测闭环全通；**三任务损失
   全部分量与官方 8.4.157 逐位/精确对齐**（seg/pose/obb 的 detect 分量 + seg/kobj/
   angle/pose 附加分量）；官方 pt 推理加载支持 ckpt nc 覆盖（obb=DOTA 15 等）；
+  **classify 训练支持目录布局数据集**（root/<class>/<img>，类按目录名排序）；
   yolo26 训练语义未与官方曲线对拍
 - **ONNX 导出**：v5-v11 标准 Detect（图内解码）+ v10/yolo26 e2e（图内两级
   topk→(1,300,6)）+ PSA 注意力族 + **seg/pose/obb 附加通道**（seg (1,116,A)
@@ -145,8 +146,8 @@ CUDA：libtorch CUDA 版即可（`tch` 运行时探测），无卡自动回退 C
   A2C2f（v12）显式报错（roadmap）
 - **数据集缓存**：labels 解析结果持久化 cache.json（构造时全量解析一次，
   二次启动零解析；条目数不匹配自动失效重建）
-- **classify 训练**：需要目录布局数据集（images/class/*.jpg）支持，COCO 风格
-  txt 标签的 classify 训练语义未定义（官方也是分目录），当前会得到错误标注
+- **classify 训练**：支持目录布局数据集（data=<root>，子目录即类）；COCO 风格
+  txt 标签不适用于 classify（官方同样分目录）
 - **曲线级对拍**：与官方 trainer 的逐 epoch 收敛对比脚本见
   `scripts/curve_parity.py`（同参数同数据双方训练），尚未跑 COCO 全量基准
 - **pickle VM**：支持 torch.save 协议 2-4 的 torch 标准子集；

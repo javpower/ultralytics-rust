@@ -49,6 +49,7 @@ pub enum TaskKind {
     Pose,
     Segment,
     Obb,
+    Classify,
 }
 
 /// 数据集（某个 split）。
@@ -110,6 +111,60 @@ impl YoloDataset {
         }
         let mut ds = YoloDataset { img_files, label_files, names, kpt_dim, task, cache: Default::default() };
         ds.init_cache();
+        Ok(ds)
+    }
+
+    /// classify 目录布局：root/<class_name>/*.jpg，类按目录名排序，标注 = 类 id。
+    pub fn from_classify_dir(img_dir: &Path, names: Vec<String>) -> Result<Self, UlError> {
+        let exts = ["jpg", "jpeg", "png", "webp", "bmp"];
+        let mut class_dirs: Vec<PathBuf> = std::fs::read_dir(img_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        class_dirs.sort();
+        if class_dirs.is_empty() {
+            return Err(UlError::Msg(format!("no class dirs under {}", img_dir.display())));
+        }
+        let mut img_files = Vec::new();
+        let mut labels: std::collections::HashMap<String, Vec<Vec<f32>>> = Default::default();
+        for (ci, cd) in class_dirs.iter().enumerate() {
+            let mut files: Vec<PathBuf> = walkdir::WalkDir::new(cd)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_path_buf())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|x| x.to_str())
+                            .map(|x| exts.contains(&x.to_lowercase().as_str()))
+                            .unwrap_or(false)
+                })
+                .collect();
+            files.sort();
+            for f in files {
+                img_files.push(f.clone());
+                let key = f.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                labels.insert(key, vec![vec![ci as f32]]);
+            }
+        }
+        if img_files.is_empty() {
+            return Err(UlError::Msg(format!("no images under {}", img_dir.display())));
+        }
+        let label_files = img_files.iter().map(|p| PathBuf::from("")).collect();
+        let mut ds = YoloDataset {
+            img_files,
+            label_files,
+            names,
+            kpt_dim: 0,
+            task: TaskKind::Classify,
+            cache: labels,
+        };
+        ds.names = (0..class_dirs.len()).map(|i| format!("c{i}")).collect();
         Ok(ds)
     }
 

@@ -294,12 +294,17 @@ pub struct TrainReport {
 
 /// 训练入口（检测家族；分类/分割/姿态/旋转框按 task 分支见 validate/predict）。
 pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<TrainReport, UlError> {
+    // classify：data 即目录布局根（root/<class>/<img>），不走 yaml
+    if model.task == Task::Classify {
+        return train_classify(model, data, cfg);
+    }
     let (train_dirs, val_dirs, names, _kpt_dim) = ul_data::dataset::load_dataset_yaml(data)?;
     // 数据集任务标签解析跟随模型任务（seg 多边形 / obb 九点 / pose kpt / detect）
     let ds_task0 = match model.task {
         Task::Segment => ul_data::dataset::TaskKind::Segment,
         Task::Obb => ul_data::dataset::TaskKind::Obb,
         Task::Pose => ul_data::dataset::TaskKind::Pose,
+        Task::Classify => ul_data::dataset::TaskKind::Classify,
         _ => {
             if _kpt_dim > 0 {
                 ul_data::dataset::TaskKind::Pose
@@ -308,15 +313,30 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             }
         }
     };
-    let mut train_ds = YoloDataset::with_task(&train_dirs[0], names.clone(), _kpt_dim, ds_task0)?;
+    let classify_mode = ds_task0 == ul_data::dataset::TaskKind::Classify;
+    let mut train_ds = if classify_mode {
+        YoloDataset::from_classify_dir(&train_dirs[0], names.clone())?
+    } else {
+        YoloDataset::with_task(&train_dirs[0], names.clone(), _kpt_dim, ds_task0)?
+    };
     for d in &train_dirs[1..] {
-        let extra = YoloDataset::with_task(d, names.clone(), _kpt_dim, ds_task0)?;
+        let extra = if classify_mode {
+            YoloDataset::from_classify_dir(d, names.clone())?
+        } else {
+            YoloDataset::with_task(d, names.clone(), _kpt_dim, ds_task0)?
+        };
         train_ds.img_files.extend(extra.img_files);
-        train_ds.label_files.extend(extra.label_files);
+        train_ds.cache.extend(extra.cache);
     }
     let val_ds = val_dirs
         .first()
-        .map(|d| YoloDataset::with_task(d, names.clone(), _kpt_dim, ds_task0))
+        .map(|d| {
+            if classify_mode {
+                YoloDataset::from_classify_dir(d, names.clone())
+            } else {
+                YoloDataset::with_task(d, names.clone(), _kpt_dim, ds_task0)
+            }
+        })
         .transpose()?;
 
     let nc = model.nc;
@@ -468,6 +488,10 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                     smp.img = letterbox(&smp.img, bsz, [114, 114, 114]);
                 }
                 for ins in &smp.instances {
+                    if classify_mode {
+                        labels.push(vec![bi as f32, ins.cls as f32]);
+                        continue;
+                    }
                     let mut row = vec![bi as f32, ins.cls as f32, ins.xywhn[0], ins.xywhn[1], ins.xywhn[2], ins.xywhn[3]];
                     if ds_task == ul_data::dataset::TaskKind::Obb {
                         row.push(ins.angle);
@@ -483,7 +507,13 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                 imgs.push(smp.img);
             }
             let img_t = to_tensor(&imgs, cfg.device);
-            let ncol = if ds_task == ul_data::dataset::TaskKind::Obb { 7 } else { 6 };
+            let ncol = if classify_mode {
+                2
+            } else if ds_task == ul_data::dataset::TaskKind::Obb {
+                7
+            } else {
+                6
+            };
             let flat: Vec<f32> = labels.concat();
             let labels_t = if flat.is_empty() {
                 Tensor::zeros([0, ncol], (Kind::Float, cfg.device))
@@ -678,6 +708,90 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
     // 最后保存 last
     save_checkpoint(model, &save_dir.join("last"), &names)?;
     Ok(TrainReport { save_dir, best_fitness, final_metrics: best_map, epochs_done })
+}
+
+/// classify 训练：目录布局数据集（root/<class>/<img>），交叉熵 + label smoothing + EMA。
+#[allow(unused_imports)]
+fn train_classify(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<TrainReport, UlError> {
+    let names = (0..model.nc).map(|i| format!("c{i}")).collect::<Vec<_>>();
+    let mut train_ds = ul_data::dataset::YoloDataset::from_classify_dir(data, names.clone())?;
+    let val_ds = std::fs::read_dir(data.parent().unwrap_or(data))
+        .ok()
+        .and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && p.file_name().map(|f| f == "val").unwrap_or(false))
+        })
+        .map(|vp| ul_data::dataset::YoloDataset::from_classify_dir(&vp, names.clone()))
+        .transpose()?;
+
+    let nc = model.nc;
+    model.names = (0..nc).map(|i| format!("c{i}")).collect();
+    let save_dir = cfg.project.join(format!("{}{}", cfg.name, if cfg.exist_ok { "" } else { "" }));
+    std::fs::create_dir_all(&save_dir)?;
+    let (lr0, momentum) = if cfg.optimizer == "auto" { (0.001, 0.9) } else { (cfg.lr0, cfg.momentum) };
+    let kind2 = if cfg.optimizer == "SGD" { OptKind2::Sgd } else { OptKind2::AdamW };
+    let mut opt = ManualOptimizer::new(model, kind2, lr0, momentum, 0.0);
+    let mut ema = ModelEma::new(model);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+    let mut epochs_done = 0;
+    let mut best = 0f64;
+    let mut metrics_log = std::fs::File::create(save_dir.join("metrics.jsonl"))?;
+    for epoch in 0..cfg.epochs {
+        let mut order: Vec<usize> = (0..train_ds.len()).collect();
+        use rand::seq::SliceRandom as _;
+        order.shuffle(&mut rng);
+        let mut ep_loss = 0f64;
+        let mut it = 0usize;
+        for chunk in order.chunks(cfg.batch) {
+            let mut imgs = Vec::with_capacity(chunk.len());
+            let mut targets: Vec<i64> = Vec::with_capacity(chunk.len());
+            for &idx in chunk {
+                let mut smp = train_ds.load(idx)?;
+                let (rw, rh) = crate::nms::rect_letterbox_size(smp.img.w, smp.img.h, cfg.imgsz.max(64), 32);
+                smp.img = ul_data::augment::letterbox_rect(&smp.img, rw, rh, [114, 114, 114]);
+                {
+                    use rand::Rng as _;
+                    let (a, b, c, d) = {
+                        let (a, b, c, d) = rand::random::<(f32, f32, f32, f32)>();
+                        (a, b, c, d)
+                    };
+                    ul_data::augment::random_erasing(&mut smp, cfg.augment.erasing, a, b, c, d);
+                }
+                targets.push(smp.instances.first().map(|x| x.cls).unwrap_or(0));
+                imgs.push(smp.img);
+            }
+            let x = to_tensor(&imgs, device_of(model));
+            let logits = match model.forward(&x, true).unwrap() {
+                ModelOutput::Classify(a, _) => a,
+                _ => panic!("classify expects classify head"),
+            };
+            let loss = classification_loss(
+                &logits,
+                &Tensor::from_slice(&targets.iter().map(|x| *x as i64).collect::<Vec<_>>()).to_device(cfg.device),
+                0.1,
+            );
+            loss.backward();
+            ep_loss += f64::try_from(&loss).unwrap_or(0.0);
+            it += 1;
+            ema.update(model, epoch * ((train_ds.len() + cfg.batch - 1) / cfg.batch) + it);
+            if it % cfg.nbs.max(1).max(cfg.batch) == 0 || it * cfg.batch >= train_ds.len() {
+                opt.clip_grad(10.0);
+                opt.step();
+                opt.zero_grad();
+            }
+        }
+        epochs_done = epoch + 1;
+        log::info!("epoch {}/{} cls_loss={:.4}", epoch + 1, cfg.epochs, ep_loss / it.max(1) as f64);
+        let _ = metrics_log;
+    }
+    ema.apply_to(model);
+    save_checkpoint(model, &save_dir.join("last"), &model.names)?;
+    Ok(TrainReport { save_dir, best_fitness: best, final_metrics: DetMetrics::default(), epochs_done })
+}
+
+fn device_of(model: &YoloModel) -> tch::Device {
+    model.vs.device()
 }
 
 /// 验证数据集（复用已构建模型）。
