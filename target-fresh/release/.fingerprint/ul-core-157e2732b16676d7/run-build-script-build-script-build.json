@@ -1,1 +1,0 @@
-{"rustc":3720210673988096810,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[15388073289191239922,"build_script_build",false,7881773460265546098]],"local":[{"RerunIfChanged":{"output":"release\\build\\ul-core-157e2732b16676d7\\output","paths":["../../ultralytics/cfg"]}}],"rustflags":[],"config":0,"compile_kind":0}
