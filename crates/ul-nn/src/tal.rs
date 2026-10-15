@@ -108,6 +108,17 @@ impl TaskAlignedAssigner {
         let (mut align_metric, mut overlaps) =
             self.get_box_metrics_impl(pd_scores, pd_bboxes, gt_labels, gt_bboxes, &(mask_in_gts.to_kind(Kind::Bool) * mask_gt), rotated);
 
+        if std::env::var("UL_OBB_DEBUG").is_ok() && rotated {
+            let f = |t: &Tensor| f64::try_from(&t.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+            eprintln!("[tal-mid] in_gts={} ovl_sum={:.4} align_max={:.6} (official 2546 / 89.5066 / 0.000445)",
+                f(&mask_in_gts), f(&overlaps.shallow_clone()), f(&align_metric.f_amax(&[-1], false).unwrap()));
+            {
+                let flat = align_metric.reshape([-1]);
+                let (tv, ti) = flat.topk(3, 0, true, true);
+                eprintln!("[tal-mid] align top3={:?} at={:?}",
+                    Vec::<f32>::try_from(&tv).unwrap_or_default(), Vec::<i64>::try_from(&ti).unwrap_or_default());
+            }
+        }
         // 2) topk 候选（每 gt 取 align 最高的 topk 锚；重复命中置 0）
         let topk_mask = mask_gt.expand([bs, m, self.topk], true);
         let mask_topk = self.select_topk_candidates(&align_metric, Some(&topk_mask));

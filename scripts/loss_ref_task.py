@@ -91,7 +91,13 @@ def dump(task, model_pt, loss_cls, gains, extra_names):
                 assigner = crit.assigner
                 pd_in = pd.detach().clone()
                 pd_in[..., :4] *= st_
+                # 重跑分配拿 overlaps（赋值器内部不返回，改手动镜像 norm 前的 align/overlaps）
+                mask_in_gts = assigner.select_candidates_in_gts(ap_ * st_, gb, mg).bool()
+                align_m, ovl = assigner.get_box_metrics(
+                    preds["scores"].detach().permute(0,2,1).sigmoid(), pd_in.detach().type(gb.dtype), gl, gb, mask_in_gts * mg.bool())
                 _, tb, ts, fg, _ = assigner(preds["scores"].detach().permute(0,2,1).sigmoid(), pd_in.type(gb.dtype), ap_*st_, gl, gb, mg)
+                mid["ovl_sum"] = float(ovl.sum())
+                mid["align_max"] = float(align_m.max())
             else:
                 pd = crit.bbox_decode(ap_, preds["boxes"].permute(0,2,1))
                 tgt = torch.cat((batch["batch_idx"].view(-1,1), batch["cls"].view(-1,1), batch["bboxes"]), 1)
@@ -112,6 +118,7 @@ def dump(task, model_pt, loss_cls, gains, extra_names):
             mid = {"mid_err": str(e)}
     out = {
         "task": task,
+        "nc": int(net.model[-1].nc),
         "img": img.flatten().tolist(),
         "batch_idx": batch["batch_idx"].tolist(),
         "cls": batch["cls"].flatten().tolist(),

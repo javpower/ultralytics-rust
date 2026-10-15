@@ -235,7 +235,8 @@ pub fn probiou_pairwise(obb1: &Tensor, obb2: &Tensor, ciou: bool, floor: f64) ->
     let dy: Tensor = &y1 - &y2;
     let dx: Tensor = &x1 - &x2;
     let t1: Tensor = ((&sa * dy.pow_tensor_scalar(2.0) + &sb * dx.pow_tensor_scalar(2.0)) / &denom) * 0.25;
-    let t2: Tensor = (&sc * &x2 * &dy / &denom) * 0.5;
+    // 官方 t2 = (c1+c2)·(x2−x1)·(y1−y2) / denom × 0.5（dx 定义为 x1−x2，需取反）
+    let t2: Tensor = (&sc * &dx * &dy / &denom) * -0.5;
     let inner: Tensor = ((&a1 * &b1 - c1.pow_tensor_scalar(2.0)).clamp_min(0.0)
         * (&a2 * &b2 - c2.pow_tensor_scalar(2.0)).clamp_min(0.0))
     .sqrt();

@@ -67,7 +67,9 @@ fn setup(task: &str, model_name: &str) -> Ref {
     let labels = Tensor::from_slice(&labels).reshape([n as i64, 2 + bcols as i64]);
 
     let (sd, _) = ul_nn::pt::load_pt(Path::new(&format!("../../weights/{model_name}.pt"))).unwrap();
-    let mut m = YoloModel::build(model_name, None, Device::Cpu, false).unwrap();
+    // 官方发布权重的 nc 与 yaml 默认不同（如 obb=DOTA 15），以 ckpt 实际 nc 覆盖
+    let nc = v["nc"].as_i64();
+    let mut m = YoloModel::build(model_name, nc, Device::Cpu, false).unwrap();
     ul_nn::pt::load_state_dict_into(&m.vs, &sd, false).unwrap();
     let assigner = TaskAlignedAssigner { topk: 10, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
     Ref { v, img, labels, b, s, model: m, assigner }

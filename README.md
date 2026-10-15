@@ -44,7 +44,7 @@ yolo26-depth（TorchVision 桥）、SAVPE。
 | 纯 Rust pickle VM 解析 torch.save 协议 2-4 | 全量解析（含 persistent storage、OrderedDict、BINGET 语义） |
 | 同输入前向 vs 官方 ultralytics 8.4.157（letterbox 320 实图，84 通道全通道） | **max_diff = 0.0007** |
 | **v8DetectionLoss 三分量 vs 官方 8.4.157**（同输入同权重，`loss_parity.rs`） | **box 6.6e-5 / cls 2.2e-4 / dfl 4.6e-5 相对差**；TAL 分配 fg=44 一致、target_scores_sum 7.874 vs 7.877 |
-| **任务损失对拍**（`loss_parity_task.rs`，detect 分量沿官方 v8/Pose/OBB Loss 类路径） | detect 分量（box/cls/dfl）三任务全部达标；**pose 的 pose 分量精确一致（11.1475 vs 11.1475）**；seg/kobj/obb box+cls 分量未对齐（数值见测试输出），修复跟踪中 |
+| **任务损失对拍**（`loss_parity_task.rs`，官方 v8Seg/Pose/OBB Loss 同输入同权重） | **obb box 3.4418 vs 3.4418 / cls 7.8725 vs 7.8723 / dfl 逐位一致**；**pose 分量精确一致（11.1475）**；detect 分量三任务全达标。obb 的对拍揪出并修复：旋转角点半宽 bug（in_gts 曾虚增 4 倍）、probiou t2 交叉项 dx 符号反、obb 角度误乘 imgsz、**ckpt nc 与 yaml nc 不同需覆盖**（DOTA 15） |
 | COCO 评测：compute_ap 对拍 numpy 真值（trapz 梯形积分语义） | 完美预测 0.995 精确一致 |
 | 全系列构建+前向 | 48/48 |
 | **ONNX 导出（v5-v11 全路径，图内 DFL+dist2bbox+sigmoid）** | onnx.checker 通过；onnxruntime 对拍官方 eval 前向：yolov8n 320→(1,84,2100) **max_diff 6.4e-4**、640→(1,84,8400) **9.5e-4**；yolo11n（含 C2PSA 注意力）**7.8e-4** |
@@ -131,11 +131,11 @@ CUDA：libtorch CUDA 版即可（`tch` 运行时探测），无卡自动回退 C
 - **训练侧未实现**：AMP（fp16 autocast）、多卡 DDP、rect（最小矩形）训练与推理
 - **增强未实现**：copy_paste、erasing、cutout（mosaic/mixup/透视/HSV/翻转/BGR/
   close_mosaic 已实现且可透传）
-- **任务面**：detect/classify/segment/pose/obb 训练+评测闭环全通；任务损失对拍
-  现状：**pose 的 pose 分量与官方精确一致**，各任务沿用的 detect 分量（box/cls/dfl）
-  全部达标；**seg 掩码损失、pose kobj、obb 的 box/cls 分量数值未对齐**
-  （已修复旋转 mask_in_gts 的半宽 bug 与 obb 角度误缩放，剩余差异排查中，
-  `loss_parity_task.rs` 输出逐分量对比）；yolo26 训练语义未与官方曲线对拍
+- **任务面**：detect/classify/segment/pose/obb 训练+评测闭环全通；任务损失对拍：
+  obb 的 box/cls/dfl 与 pose 的 pose 分量已对齐（前者逐位），detect 分量全达标；
+  **seg 掩码分量（17.7 vs 7.3）、pose kobj（0.03 vs 1.24）、obb angle（0.37 vs 0.41）
+  数值未对齐**——已排除分配差异（in_gts/fg 逐位一致）、probiou 数值（ovl_sum 逐位
+  一致），剩余差异在掩码/BCE 细节语义，排查继续；yolo26 训练语义未与官方曲线对拍
 - **ONNX 导出**：detect 家族全覆盖——v5-v11 标准 Detect（图内解码）+ v10/yolo26
   e2e（图内两级 topk→(1,300,6)）+ PSA 注意力族（Psa/C2PSA/C2fPSA/BottleneckPsa）；
   seg/pose/obb 头导出与 A2C2f（v12）显式报错（roadmap）；v10 官方权重资产缺失，
