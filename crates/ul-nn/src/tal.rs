@@ -5,6 +5,8 @@
 use tch::{Kind, Tensor};
 
 use crate::ops::bbox_iou_ciou_batched;
+#[allow(unused_imports)]
+use crate::ops::bbox_iou_pairwise;
 
 /// TAL 分配器。
 pub struct TaskAlignedAssigner {
@@ -60,18 +62,14 @@ impl TaskAlignedAssigner {
             };
         }
 
-        let dbg = std::env::var("UL_LOSS_DEBUG").is_ok();
         // 1) 框内锚 + 对齐指标（(bs, m, A)）
         let mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt);
-        if dbg { eprintln!("[tal] in_gts={:?} pts={:?}", mask_in_gts.size(), anc_points.size()); }
         let (mut align_metric, mut overlaps) =
             self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, &(mask_in_gts.to_kind(Kind::Bool) * mask_gt));
-        if dbg { eprintln!("[tal] align={:?} ov={:?}", align_metric.size(), overlaps.size()); }
 
         // 2) topk 候选（每 gt 取 align 最高的 topk 锚；重复命中置 0）
         let topk_mask = mask_gt.expand([bs, m, self.topk], true);
         let mask_topk = self.select_topk_candidates(&align_metric, Some(&topk_mask));
-        if dbg { eprintln!("[tal] topk={:?}", mask_topk.size()); }
 
         // 3) 合并正样本掩码
         let mut mask_pos = mask_topk
@@ -79,9 +77,7 @@ impl TaskAlignedAssigner {
             * mask_gt.to_kind(Kind::Float);
 
         // 4) 一锚多 gt 仲裁
-        if dbg { eprintln!("[tal] mask_pos={:?}", mask_pos.size()); }
         let (fg_mask_f, target_gt_idx) = self.select_highest_overlaps(&mut mask_pos, &mut overlaps);
-        if dbg { eprintln!("[tal] fg={:?} idx={:?}", fg_mask_f.size(), target_gt_idx.size()); }
 
         // 5) 目标
         let (target_labels, target_bboxes, target_scores) =
@@ -93,8 +89,8 @@ impl TaskAlignedAssigner {
         overlaps = overlaps * mask_pos;
         let pos_overlaps = overlaps.amax_last(-1, true); // (bs, m, 1)
         let normed = align_metric * pos_overlaps / (pos_align_metrics + self.eps);
-        let norm_align_metric = normed.amax_last(-2, false).unsqueeze(-1); // (bs, A, 1)
-        let target_scores = target_scores * norm_align_metric;
+        let norm_align_metric = normed.amax_last(-2, false).unsqueeze(-1).clamp(0.0, 1.0); // (bs, A, 1)
+        let target_scores = (target_scores * norm_align_metric).clamp(0.0, 1.0);
 
         AssignOut {
             target_labels,
@@ -152,8 +148,8 @@ impl TaskAlignedAssigner {
         let m = gt_bboxes.size()[1];
         let shape = [bs, m, na];
         let zeros = Tensor::zeros(shape, (Kind::Float, pd_bboxes.device()));
-        let total: Vec<i64> = Vec::try_from(&mask.sum_dim_intlist(None::<&[i64]>, false, Kind::Int)).unwrap_or_default();
-        if total.first().copied().unwrap_or(0) == 0 {
+        let total = f64::try_from(&mask.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+        if total == 0.0 {
             return (zeros.shallow_clone(), zeros);
         }
         // indices = mask.nonzero → (K, 3)
@@ -165,27 +161,25 @@ impl TaskAlignedAssigner {
         let lbl = gt_labels.select(2, 0).to_kind(Kind::Int64); // (bs, m)
         let lbl_sel = lbl.index_select(0, &b_idx).index_select(1, &g_idx); // (K, 1) g_idx 是逐 K 的列选择——改为 gather
         let _ = lbl_sel;
-        // 简化：直接用 K 索引三元组取值
+        // 逐三元组取值：label = lbl[b, g]
         let ps = pd_scores.permute([0, 2, 1]); // (bs, nc, A)
-        let scores_sel = batched_select3(&ps, &b_idx, &lbl.index_select(0, &b_idx).select(1, 0), &a_idx);
+        let lbl_k = batched_select2_i64(&lbl, &b_idx, &g_idx); // (K,)
+        let scores_sel = batched_select3(&ps, &b_idx, &lbl_k, &a_idx);
         let gt_sel = batched_select2(gt_bboxes, &b_idx, &g_idx); // (K, 4)
         let pd_sel = batched_select2(pd_bboxes, &b_idx, &a_idx); // (K, 4)
-        let overlap_vals = bbox_iou_ciou_batched(&gt_sel.unsqueeze(0), &pd_sel.unsqueeze(0), self.eps)
-            .squeeze_dim(0); // (1, K, 1)?? → 需要成对：用 pairwise
-        let _ = overlap_vals;
         // 成对 CIoU（K 对）
-        let ov = crate::ops::bbox_iou_pairwise(&gt_sel, &pd_sel, true); // (K, 1)
+        let ov = crate::ops::bbox_iou_pairwise(&gt_sel, &pd_sel, true).squeeze_dim(1); // (K,)
         let align_vals = scores_sel.pow_tensor_scalar(self.alpha) * ov.pow_tensor_scalar(self.beta);
 
         let overlaps = zeros.shallow_clone().index_put_(
             &[Some(&b_idx), Some(&g_idx), Some(&a_idx)],
-            &ov.squeeze_dim(1),
+            &ov,
             false,
         );
         let mut zeros = zeros;
         let align = zeros.index_put_(
             &[Some(&b_idx), Some(&g_idx), Some(&a_idx)],
-            &align_vals.squeeze_dim(1),
+            &align_vals,
             false,
         );
         (align, overlaps)
@@ -214,21 +208,28 @@ impl TaskAlignedAssigner {
         count.eq(1.0).to_kind(Kind::Float)
     }
 
-    /// 一锚多 gt：保留 IoU 最大的 gt。就地更新 mask_pos/overlaps。返回 (fg (bs, A) float, idx (bs, A) i64)。
+    /// select_highest_overlaps（官方）：一锚多 gt → 保留重叠最大的 gt。
+    /// 全程 (bs, m, A)。返回 (fg (bs, A) float, idx (bs, A) i64)。
     fn select_highest_overlaps(&self, mask_pos: &mut Tensor, overlaps: &mut Tensor) -> (Tensor, Tensor) {
-        let m = mask_pos.size()[1];
+        let (bs, m, a) = (mask_pos.size()[0], mask_pos.size()[1], mask_pos.size()[2]);
+        let device = mask_pos.device();
         let fg_any = mask_pos.sum_dim_intlist(Some(&[1i64][..]), false, Kind::Float); // (bs, A)
         let multi = fg_any.gt(1.0);
-        let anyv: Vec<i64> = Vec::try_from(&multi.any()).unwrap_or_default();
-        if anyv.first().copied().unwrap_or(0) != 0 {
+        let anyv = f64::try_from(&multi.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+        if anyv > 0.0 {
+            let mask_multi = multi.unsqueeze(1).expand([bs, m, a], true); // (bs, m, A)
             let max_idx = overlaps.argmax(1, false); // (bs, A)
-            let is_max = one_hot_i64(&max_idx, m); // (bs, m, A)
-            let mm = multi.unsqueeze(1).to_kind(Kind::Float);
-            *mask_pos = is_max * mm.shallow_clone() + mask_pos.shallow_clone() * (1.0 - mm);
+            // is_max: (bs, m, A) 沿 dim1 scatter
+            let ones = Tensor::ones([bs, 1, a], (Kind::Float, device));
+            let is_max = Tensor::zeros([bs, m, a], (Kind::Float, device))
+                .scatter(1, &max_idx.unsqueeze(1), &ones);
+            // mask_pos = where(mask_multi, is_max, mask_pos)
+            let keep = mask_pos.shallow_clone() * (1.0 - mask_multi.to_kind(Kind::Float));
+            let take = is_max * mask_multi.to_kind(Kind::Float);
+            *mask_pos = take + keep;
         }
-        let fg = mask_pos.sum_dim_intlist(Some(&[1i64][..]), false, Kind::Float).clamp(0.0, 1.0);
-        let idx = mask_pos.argmax(1, false);
-        (fg, idx)
+        let maxed = mask_pos.max_dim(1, false); // (values (bs,A), indices (bs,A))
+        (maxed.0, maxed.1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -286,12 +287,17 @@ fn one_hot_i64(idx: &Tensor, n: i64) -> Tensor {
     zeros.scatter(2, &idx.unsqueeze(2), &ones)
 }
 
+/// (bs, X) i64 按 (b, g) 取值 → (K,)。
+fn batched_select2_i64(t: &Tensor, b: &Tensor, g: &Tensor) -> Tensor {
+    let sel = t.index_select(0, b); // (K, m)
+    sel.gather(1, &g.reshape([-1, 1]), false).squeeze_dim(1)
+}
+
 /// (bs, X, Y) 张量按三元组取值 → (K,)。
 fn batched_select3(t: &Tensor, b: &Tensor, y: &Tensor, x: &Tensor) -> Tensor {
     // 先 gather y（通道），再 gather x（空间）
-    let bs = t.size()[0];
     let sel_y = t.index_select(0, b); // (K, Y, X)
-    let yy = y.reshape([-1, 1]);
+    let yy = y.reshape([-1, 1, 1]).expand([-1, 1, sel_y.size()[2]], true);
     let picked_y = sel_y.gather(1, &yy, false).squeeze_dim(1); // (K, X)
     picked_y.gather(1, &x.reshape([-1, 1]), false).squeeze_dim(1)
 }

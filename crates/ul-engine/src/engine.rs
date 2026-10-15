@@ -246,8 +246,9 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             let ni = epoch * nb + it;
             // warmup lr/momentum
             if ni < nw {
+                // 官方：lr 从 0 线性升到 lr0；momentum 从 0.8 升到目标
                 let xn = (ni as f64) / nw as f64;
-                let lr_now = lr0 * (1.0 - xn) + 0.1 * xn; // bias lr 简化统一
+                let lr_now = lr0 * xn;
                 let _ = opt.set_lr(lr_now);
                 let mom_now = 0.8 + (momentum - 0.8) * xn;
                 opt.set_momentum(mom_now);

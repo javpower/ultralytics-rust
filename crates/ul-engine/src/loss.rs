@@ -92,11 +92,10 @@ pub fn detect_branch_loss(
 
     // 目标
     let (gt_labels, gt_bboxes, mask_gt) = prepare_targets(batch);
-    if std::env::var("UL_LOSS_DEBUG").is_ok() {
-        eprintln!("[loss] targets: gl={:?} gb={:?} mg={:?} scores_t={:?} pdb={:?}",
-            gt_labels.size(), gt_bboxes.size(), mask_gt.size(), scores_t.size(), pd_bboxes.size());
-    }
-    let out = assigner.assign(&scores_t, &pd_bboxes.transpose(1, 2), points, &gt_labels, &gt_bboxes, &mask_gt);
+
+    // 官方语义：锚点以像素坐标参与分配（anchors × strides）
+    let anc_pixels = &(&points2 * &strides2); // (2, A)
+    let out = assigner.assign(&scores_t, &pd_bboxes.transpose(1, 2), anc_pixels, &gt_labels, &gt_bboxes, &mask_gt);
     let AssignRef { target_bboxes, target_scores, fg_mask } = AssignRef {
         target_bboxes: out.target_bboxes,
         target_scores: out.target_scores,
@@ -104,14 +103,18 @@ pub fn detect_branch_loss(
     };
     let target_scores_sum = target_scores.sum_dim_intlist(None::<&[i64]>, false, Kind::Float).clamp_min(1.0);
 
-    // cls BCE
-    let cls_loss = bce_sum(&scores_t, &target_scores) / target_scores_sum.shallow_clone() / w.cls;
+    // cls BCE（BCE-with-logits 需要原始 logits，preds.scores 未过 sigmoid）
+    let logits_t = preds.scores.transpose(1, 2).contiguous();
+    let cls_loss = bce_sum(&logits_t, &target_scores) / target_scores_sum.shallow_clone() / w.cls;
 
     let fg_sum = fg_mask.sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
     let has_fg = Vec::<i64>::try_from(&fg_sum).map(|v| v.first().copied().unwrap_or(0)).unwrap_or(0) > 0;
     if !has_fg {
         // 无前景：仅 cls；dfl/box 记零（保持梯度路径有内容：乘 0）
         let zero = scores.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) * 0.0;
+        if std::env::var("UL_LOSS_DEBUG").is_ok() {
+            eprintln!("[nofg] cls_loss={:.3}", f64::try_from(&cls_loss).unwrap_or(f64::NAN));
+        }
         return cls_loss + zero * (w.box_gain + w.dfl) * (if one2one { 1.0 } else { 1.0 });
     }
 
@@ -137,10 +140,15 @@ pub fn detect_branch_loss(
     let iou_loss = iou_term.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / target_scores_sum.shallow_clone() * w.box_gain;
 
     // DFL
-    let dfl_term = match dfl_apply_model(model, &preds.boxes, &fg_mask, &target_bboxes_g, points) {
+    let dfl_term = match dfl_apply_model(model, &preds.boxes, &fg_mask, &target_bboxes_g, points, &weight) {
         Some(d) => d / target_scores_sum.shallow_clone() * w.dfl,
         None => scores.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) * 0.0, // reg_max=1（yolo26 无 DFL）
     };
+
+    // 数值安全：各分量截到 ≥ 0（退化框时 CIoU 罚项可能越界）
+    let cls_loss = cls_loss.clamp_min(0.0);
+    let iou_loss = iou_loss.clamp_min(0.0);
+    let dfl_term = dfl_term.clamp_min(0.0);
 
     cls_loss + iou_loss + dfl_term
 }
@@ -168,6 +176,7 @@ fn dfl_apply_model(
     fg_mask: &Tensor,     // (B, A) bool
     target_bboxes: &Tensor, // (B, A, 4) 格单位 xyxy
     points: &Tensor,      // (2, A) anchor 中心（格单位）
+    weight: &Tensor,      // (N, 1) 每 fg 锚的分数权重
 ) -> Option<Tensor> {
     let last = model.layers.last().unwrap();
     let reg_max = if let ul_nn::parse::Module::Head(ul_nn::parse::HeadMod::Detect(dh)) = &last.module {
@@ -204,9 +213,7 @@ fn dfl_apply_model(
     let ce1 = cross_entropy(&pd.reshape([n * 4, reg_max]), &pos1.reshape([-1])).reshape([n, 4]);
     let ce2 = cross_entropy(&pd.reshape([n * 4, reg_max]), &pos2.reshape([-1])).reshape([n, 4]);
     let dfl = ((&ce1 * w1 + &ce2 * w2) as Tensor).mean_dim(Some(&[1i64][..]), true, Kind::Float); // (N, 1)
-    let weight = select_fg_points_weight(fg_mask); // 由调用方权重处理：此处返回未加权，乘权在 loss 层
-    let _ = weight;
-    Some(dfl.sum_dim_intlist(None::<&[i64]>, false, Kind::Float))
+    Some((dfl * weight).sum_dim_intlist(None::<&[i64]>, false, Kind::Float))
 }
 
 fn select_fg_points(points: &Tensor, fg: &Tensor) -> Tensor {
@@ -214,10 +221,6 @@ fn select_fg_points(points: &Tensor, fg: &Tensor) -> Tensor {
     let a = points.size()[1];
     let pts = points.transpose(0, 1).reshape([a, 2]);
     pts.index_select(0, &fg.reshape([-1]).nonzero().squeeze_dim(1))
-}
-
-fn select_fg_points_weight(_fg: &Tensor) -> Option<Tensor> {
-    None
 }
 
 fn select_fg(t: &Tensor, fg: &Tensor) -> Tensor {
@@ -238,10 +241,11 @@ fn xywh_to_xyxy(x: &Tensor) -> Tensor {
 }
 
 /// 数值稳定 BCE（sum 归约）。
+/// BCE with logits：max(z,0) − z·t + log(1+exp(−|z|))，等价 softplus(z) − t·z。
 fn bce_sum(pred: &Tensor, target: &Tensor) -> Tensor {
     let p = pred.clamp(-100.0, 100.0);
     let softplus = (&p.neg().exp() + 1.0).log();
-    let l = &softplus - target * (&p - &softplus);
+    let l = &softplus - target * &p;
     l.sum_dim_intlist(None::<&[i64]>, false, Kind::Float)
 }
 

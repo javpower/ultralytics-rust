@@ -61,20 +61,20 @@ fn tensor_proto(name: &str, dims: &[i64], data: TensorData) -> Vec<u8> {
     }
     match &data {
         TensorData::F32(v) => {
+            int64_field(&mut b, 2, 1); // FLOAT
             let mut raw = Vec::with_capacity(v.len() * 4);
             for f in v {
                 raw.extend_from_slice(&f.to_le_bytes());
             }
             bytes_field(&mut b, 4, &raw);
-            int64_field(&mut b, 9, 1);
         }
         TensorData::I64(v) => {
-            let mut raw = Vec::with_capacity(v.len() * 8);
+            int64_field(&mut b, 2, 7); // INT64
+            let mut raw = Vec::with_capacity(v.len() * 10);
             for f in v {
-                raw.extend_from_slice(&f.to_le_bytes());
+                varint(&mut raw, *f as u64); // packed varint（含负数补码）
             }
             bytes_field(&mut b, 7, &raw);
-            int64_field(&mut b, 9, 7);
         }
     }
     str_field(&mut b, 8, name);
@@ -88,30 +88,39 @@ enum AttrVal {
 }
 
 fn node_proto(op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrVal)]) -> Vec<u8> {
+    node_proto_named(op, inputs, outputs, attrs, "")
+}
+
+fn node_proto_named(op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrVal)], name: &str) -> Vec<u8> {
+    // NodeProto: input=1, output=2, name=3, op_type=4, attribute=5
     let mut b = Vec::new();
-    str_field(&mut b, 1, "");
-    str_field(&mut b, 2, op);
     for i in inputs {
-        str_field(&mut b, 3, i);
+        str_field(&mut b, 1, i);
     }
     for o in outputs {
-        str_field(&mut b, 4, o);
+        str_field(&mut b, 2, o);
     }
+    str_field(&mut b, 3, name);
+    str_field(&mut b, 4, op);
     for (an, av) in attrs {
         let mut ab = Vec::new();
         str_field(&mut ab, 1, an);
         match av {
-            AttrVal::I(v) => int64_field(&mut ab, 20, *v),
+            AttrVal::I(v) => {
+                int64_field(&mut ab, 20, 2); // type = INT
+                int64_field(&mut ab, 3, *v); // i = 3
+            }
             AttrVal::Is(v) => {
+                int64_field(&mut ab, 20, 7); // type = INTS
                 let mut raw = Vec::new();
                 for x in v {
-                    int64_field(&mut raw, 20, *x);
+                    varint(&mut raw, *x as u64); // packed：仅值，无 tag
                 }
-                bytes_field(&mut ab, 18, &raw);
+                bytes_field(&mut ab, 8, &raw);
             }
             AttrVal::S(s) => {
-                bytes_field(&mut ab, 9, s.as_bytes());
-                int64_field(&mut ab, 20, 3);
+                int64_field(&mut ab, 20, 3); // type = STRING
+                bytes_field(&mut ab, 4, s.as_bytes()); // s = 4
             }
         }
         bytes_field(&mut b, 5, &ab);
@@ -119,19 +128,32 @@ fn node_proto(op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrV
     b
 }
 
-/// ValueInfoProto（张量类型，无 shape 约束）。
-fn value_info(name: &str) -> Vec<u8> {
-    let mut t = Vec::new();
+/// ValueInfoProto：动态 batch 输入 [1,3,S,S]；输出 [1,4+nc,A] 由运行时决定。
+fn value_info(name: &str, dims: &[i64]) -> Vec<u8> {
+    // TypeProto { tensor_type=1: Tensor { elem_type=1, shape=2: { dim=1: { dim_value=1 } } } }
     let mut tt = Vec::new();
-    int64_field(&mut tt, 1, 1); // FLOAT
-    bytes_field(&mut t, 1, &tt);
+    let mut tensor = Vec::new();
+    int64_field(&mut tensor, 1, 1); // FLOAT
+    let mut shape = Vec::new();
+    for d in dims {
+        let mut dim = Vec::new();
+        if *d < 0 {
+            // 未知维：dim_param 字符串（field 2）
+            str_field(&mut dim, 2, "dyn");
+        } else {
+            int64_field(&mut dim, 1, *d); // Dimension.dim_value
+        }
+        bytes_field(&mut shape, 1, &dim);
+    }
+    bytes_field(&mut tensor, 2, &shape);
+    bytes_field(&mut tt, 1, &tensor);
     let mut vi = Vec::new();
     str_field(&mut vi, 1, name);
-    bytes_field(&mut vi, 2, &t);
+    bytes_field(&mut vi, 2, &tt);
     vi
 }
 
-fn model_proto(graph: &[u8], input: &str, output: &str) -> Vec<u8> {
+fn model_proto(graph: &[u8], input: &str, output: &str, out_dims: &[i64]) -> Vec<u8> {
     let mut b = Vec::new();
     int64_field(&mut b, 1, 8); // ir_version
     let mut opset = Vec::new();
@@ -140,8 +162,8 @@ fn model_proto(graph: &[u8], input: &str, output: &str) -> Vec<u8> {
     bytes_field(&mut b, 8, &opset);
     str_field(&mut b, 2, "ultralytics-rust");
     bytes_field(&mut b, 7, graph);
-    bytes_field(&mut b, 11, &value_info(input));
-    bytes_field(&mut b, 12, &value_info(output));
+    bytes_field(&mut b, 11, &value_info(input, &[1, 3, 320, 320]));
+    bytes_field(&mut b, 12, &value_info(output, out_dims));
     b
 }
 
@@ -175,7 +197,8 @@ impl G {
     }
 
     fn node(&mut self, op: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, AttrVal)]) -> String {
-        self.nodes.push(node_proto(op, inputs, outputs, attrs));
+        let name = outputs[0].to_string();
+        self.nodes.push(node_proto_named(op, inputs, outputs, attrs, &name));
         outputs[0].to_string()
     }
 
@@ -257,7 +280,7 @@ impl G {
         let y = self.fresh(&format!("{hint}.up"));
         self.nodes.push(node_proto(
             "Resize",
-            &[x, "", "", &scales],
+            &[x, "", &scales],
             &[&y],
             &[("nearest_mode", AttrVal::S("floor")), ("mode", AttrVal::S("nearest"))],
         ));
@@ -288,7 +311,7 @@ impl G {
 }
 
 /// 导出入口。
-pub fn export_onnx(model: &YoloModel, _imgsz: u32, out_dir: &Path) -> Result<std::path::PathBuf, UlError> {
+pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std::path::PathBuf, UlError> {
     let mut g = G { nodes: vec![], inits: vec![], tmp: 0 };
     let input_name = "images".to_string();
     let mut cur = input_name.clone();
@@ -312,9 +335,20 @@ pub fn export_onnx(model: &YoloModel, _imgsz: u32, out_dir: &Path) -> Result<std
         cur = out;
     }
 
-    let mut graph = g.inits.clone();
-    graph.extend(g.nodes);
-    let mp = model_proto(&graph.concat(), &input_name, &cur);
+    // GraphProto 子消息需要各自的 tag：node=1 / initializer=5 / name=2
+    let mut graph = Vec::new();
+    for node in &g.nodes {
+        bytes_field(&mut graph, 1, node);
+    }
+    str_field(&mut graph, 2, "yolov");
+    for init in &g.inits {
+        bytes_field(&mut graph, 5, init);
+    }
+    // GraphProto.input(11) / output(12) 在 graph 内部
+    let nc_total = model.reg_max * 4 + model.nc; // 原始头输出（DFL 分布 + 类别分数）
+    bytes_field(&mut graph, 11, &value_info(&input_name, &[1, 3, imgsz as i64, imgsz as i64]));
+    bytes_field(&mut graph, 12, &value_info(&cur, &[1, nc_total, -1]));
+    let mp = model_proto(&graph, &input_name, &cur, &[1, nc_total, -1]);
     std::fs::create_dir_all(out_dir)?;
     let stem = Path::new(&model.yaml_file)
         .file_stem()
@@ -488,7 +522,11 @@ fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], 
             g.nodes.push(node_proto("Reshape", &[&o, &rn], &[&r], &[]));
             parts.push(r);
         }
-        g.concat(&parts, &format!("{p}.{name}"))
+        // 官方：三层展平后沿锚点维（dim=-1）拼接
+        let y = g.fresh(&format!("{p}.{name}.cat"));
+        let refs: Vec<&str> = parts.iter().map(|x| x.as_str()).collect();
+        g.nodes.push(node_proto("Concat", &refs, &[&y], &[("axis", AttrVal::I(-1))]));
+        y
     };
 
     let boxes = emit_branch(g, "cv2", &dh.cv2, dh.reg_max * 4);

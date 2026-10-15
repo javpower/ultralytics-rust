@@ -113,8 +113,34 @@ pub fn bbox_iou(box1: &Tensor, box2: &Tensor, giou: bool, diou: bool, ciou: bool
 
 /// 成对 IoU：box1 (N,4) vs box2 (N,4) → (N,1)（tal.py bbox_iou 语义）。
 pub fn bbox_iou_pairwise(box1: &Tensor, box2: &Tensor, ciou: bool) -> Tensor {
-    let iou = bbox_iou(box1, box2, false, false, ciou, 1e-7);
-    iou.diag(0).unsqueeze(1)
+    // 直接成对计算（不建 (N,N) 矩阵）：
+    let a_parts = box1.split_with_sizes(&[2, 2], 1);
+    let b_parts = box2.split_with_sizes(&[2, 2], 1);
+    let (a1, a2) = (&a_parts[0], &a_parts[1]);
+    let (b1, b2) = (&b_parts[0], &b_parts[1]);
+    let inter = (a2.minimum(b2) - a1.maximum(b1)).clamp_min(0.0);
+    let inter = inter.select(1, 0) * inter.select(1, 1);
+    let wh_a = a2 - a1;
+    let wh_b = b2 - b1;
+    let area_a = wh_a.select(1, 0) * wh_a.select(1, 1);
+    let area_b = wh_b.select(1, 0) * wh_b.select(1, 1);
+    let union = &area_a + &area_b - &inter + 1e-7;
+    let mut iou = (&inter / &union).clamp(0.0, 1.0); // 退化框防护：IoU 有界
+    if ciou {
+        let cw = a2.maximum(b2) - a1.minimum(b1);
+        let c_area = cw.select(1, 0) * cw.select(1, 1) + 1e-7;
+        let d = b1 + b2 - a1 - a2;
+        let rho2 = (d.select(1, 0) * d.select(1, 0)) + (d.select(1, 1) * d.select(1, 1));
+        iou = &iou - rho2 / c_area;
+        let v = ((wh_b.select(1, 0) / wh_b.select(1, 1)).atan()
+            - (wh_a.select(1, 0) / wh_a.select(1, 1)).atan())
+        .pow_tensor_scalar(2.0)
+            * (4.0 / std::f64::consts::PI.powi(2));
+        let one_minus: tch::Tensor = 1.0 - &iou;
+        let alpha = &v / (&one_minus + &v);
+        iou = &iou - (&v * alpha);
+    }
+    iou.unsqueeze(1)
 }
 
 /// 批量 CIoU：gt (bs, m, 4) × pd (bs, A, 4) → (bs, m, A)（TAL 用）。

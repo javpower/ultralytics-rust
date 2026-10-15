@@ -1,0 +1,7 @@
+E:\ultralytics-rust\target-fresh\release\deps\pkg_config-bce0dd1c24559196.d: C:\Users\A\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pkg-config-0.3.34\src\lib.rs
+
+E:\ultralytics-rust\target-fresh\release\deps\libpkg_config-bce0dd1c24559196.rlib: C:\Users\A\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pkg-config-0.3.34\src\lib.rs
+
+E:\ultralytics-rust\target-fresh\release\deps\libpkg_config-bce0dd1c24559196.rmeta: C:\Users\A\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pkg-config-0.3.34\src\lib.rs
+
+C:\Users\A\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pkg-config-0.3.34\src\lib.rs:
