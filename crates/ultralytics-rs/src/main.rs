@@ -257,10 +257,13 @@ fn load_model_for_infer(model_name: &str, device: tch::Device) -> anyhow::Result
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("yolo11n");
-        let mut m = YoloModel::build(stem, None, device, false)?;
+        // 官方发布权重的 nc 与 yaml 默认不同（如 obb=DOTA 15），从 ckpt names 推断
+        let names_ckpt = extract_names(&meta);
+        let nc = names_ckpt.as_ref().map(|n| n.len() as i64);
+        let mut m = YoloModel::build(stem, nc, device, false)?;
         ul_nn::pt::load_state_dict_into(&m.vs, &sd, false)?;
         let nc = m.nc;
-        m.names = extract_names(&meta).unwrap_or_else(|| (0..nc).map(|i| format!("class_{i}")).collect());
+        m.names = names_ckpt.unwrap_or_else(|| (0..nc).map(|i| format!("class_{i}")).collect());
         let names = m.names.clone();
         return Ok((m, nc, names));
     }

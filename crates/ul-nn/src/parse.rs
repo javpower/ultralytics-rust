@@ -586,10 +586,18 @@ pub fn parse_model(
                 let (kind, nm, npr, ne) = match m {
                     "Detect" | "v10Detect" => (ExtraKind::None, 0, 0, 0),
                     "Segment" | "Segment26" => {
+                        // 官方 ckpt 实证：nm 保持原值（不随 width 缩放，n scale 下 nm=32），
+                        // npr（proto 隐藏通道）按 width 缩放（256 → n 64）
                         let nm_default = YamlVal::Int(32);
-                let nm_arg = args.get(1).unwrap_or(&nm_default);
-                let nm_ = scaled(nm_arg, width, max_channels);
-                        (ExtraKind::Mask, nm_, arg_i(args, 2, 256), 0)
+                        let nm_arg = args.get(1).unwrap_or(&nm_default);
+                        let nm_ = match nm_arg {
+                            YamlVal::Int(v) => *v,
+                            _ => 32,
+                        };
+                        let npr_default = YamlVal::Int(256);
+                        let npr_arg = args.get(2).unwrap_or(&npr_default);
+                        let npr_ = scaled(npr_arg, width, max_channels);
+                        (ExtraKind::Mask, nm_, npr_, 0)
                     }
                     "Pose" | "Pose26" => (if m == "Pose26" { ExtraKind::Kpt26 } else { ExtraKind::Kpt }, 0, 0, 0),
                     "OBB" | "OBB26" => (if m == "OBB26" { ExtraKind::Angle26 } else { ExtraKind::Angle }, 0, 0, arg_i(args, 1, 1)),

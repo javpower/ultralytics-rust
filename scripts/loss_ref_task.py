@@ -52,6 +52,7 @@ def mk_batch(task):
         batch["bboxes"] = torch.cat([r, torch.full((r.shape[0],1), 0.3)], 1)
     return batch
 
+SEG_CALLS = []
 def dump(task, model_pt, loss_cls, gains, extra_names):
     m = YOLO(f"E:/ultralytics-rust/weights/{model_pt}")
     net = m.model
@@ -67,6 +68,21 @@ def dump(task, model_pt, loss_cls, gains, extra_names):
     crit = loss_cls(net)
     batch = mk_batch(task)
     net.train()
+    seg_calls = []
+    if task == "seg":
+        import torch.nn.functional as F2
+        _orig_sml = L_ = None
+        from ultralytics.utils import loss as LU
+        import types as T_
+        def sml(gt_mask, pred, proto, xyxy, area):
+            pred_mask = torch.einsum("in,nhw->ihw", pred, proto)
+            l_ = F2.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+            from ultralytics.utils.ops import crop_mask
+            v = (crop_mask(l_, xyxy).mean(dim=(1, 2)) / area).sum()
+            seg_calls.append((round(float(area.mean()), 5), round(float(v), 5), int(gt_mask.sum()),
+                              round(float(crop_mask(l_, xyxy).mean(dim=(1, 2)).sum()), 5)))
+            return v
+        LU.v8SegmentationLoss.single_mask_loss = staticmethod(sml)
     preds = net(img)
     if isinstance(preds, tuple) and len(preds) == 2 and isinstance(preds[1], dict):
         preds = preds[1]
@@ -132,6 +148,7 @@ def dump(task, model_pt, loss_cls, gains, extra_names):
     if task == "seg":
         out["masks"] = batch["masks"].to(torch.uint8).flatten().tolist()
         out["mask_shape"] = [B, S, S]
+        out["seg_calls"] = seg_calls
     if task == "pose":
         out["keypoints"] = batch["keypoints"].flatten().tolist()
         out["kpt_shape"] = [17, 3]

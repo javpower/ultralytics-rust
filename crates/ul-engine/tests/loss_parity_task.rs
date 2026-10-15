@@ -132,8 +132,8 @@ fn seg_loss_matches_official() {
     assert!(close(det.parts.box_, rb), "box mismatch");
     assert!(close(det.parts.cls, rc), "cls mismatch");
     assert!(close(det.parts.dfl, rd), "dfl mismatch");
-    // seg 分量未对齐（10.35 vs 7.29）——训练可用但与官方有差，见诚实清单
-    println!("NOTE: seg 分量未对齐（ours={seg:.4} ref={rs:.4}），修复前不阻断");
+    // ref 的 seg_loss 已乘 hyp.box=7.5（官方 items 语义），我们的裸值需同乘
+    assert!(close(seg * 7.5, rs), "seg mismatch: {} vs {rs}", seg * 7.5);
 }
 
 #[test]
@@ -173,10 +173,9 @@ fn pose_loss_matches_official() {
         det.parts.box_, det.parts.cls, det.parts.dfl);
     assert!(close(det.parts.box_, rb), "box mismatch");
     assert!(close(pl, rp_), "pose mismatch: {pl} vs {rp_}");
+    assert!(close(kl, rk), "kobj mismatch: {kl} vs {rk}");
     assert!(close(det.parts.cls, rc), "cls mismatch");
     assert!(close(det.parts.dfl, rd), "dfl mismatch");
-    // kobj 未对齐（0.034 vs 1.24）——v 通道语义与官方有出入，见诚实清单
-    println!("NOTE: kobj 未对齐（ours={kl:.4} ref={rk:.4}），修复前不阻断");
 }
 
 #[test]
@@ -211,9 +210,10 @@ fn obb_loss_matches_official() {
     );
     println!("obb: box {:.4}/{rb:.4} cls {:.4}/{rc:.4} dfl {:.4}/{rd:.4} angle {:.4}/{ra:.4} total {total:.4}/{:.4}",
         parts.box_, parts.cls, parts.dfl, parts.angle, v["total"].as_f64().unwrap());
-    // obb 各分量未对齐（fg=44 已一致；box/cls/dfl/angle 有差）——分配或 probiou 有出入，见诚实清单
-    println!("NOTE: obb 分量未对齐（box {}/{}、cls {}/{}、dfl {}/{}、angle {}/{}），修复前不阻断",
-        parts.box_, rb, parts.cls, rc, parts.dfl, rd, parts.angle, ra);
+    assert!(close(parts.box_, rb), "box mismatch: {} vs {rb}", parts.box_);
+    assert!(close(parts.cls, rc), "cls mismatch");
+    assert!(close(parts.dfl, rd), "dfl mismatch: {} vs {rd}", parts.dfl);
+    assert!(close(parts.angle, ra), "angle mismatch: {} vs {ra}", parts.angle);
 }
 
 // 辅助：target_scores 总和（分配一致性快速检查）

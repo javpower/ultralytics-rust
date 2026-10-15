@@ -478,6 +478,14 @@ pub fn segmentation_mask_loss(
         total_fg += nfg;
         let nz = fg.nonzero().squeeze_dim(1);
         let mask_idx = info.target_gt_idx.get(i).index_select(0, &nz); // (nf,)
+        if std::env::var("UL_LOSS_DEBUG").is_ok() {
+            // 官方语义：gt = masks[i] == (mask_idx+1)（逐实例 320² 掩码，px 和）
+            let mrow = gt_masks.get(i).reshape([gh * gw]);
+            let one_p = &mask_idx + 1;
+            let gts = (mrow.unsqueeze(0) - &one_p.unsqueeze(1)).abs().lt(1e-3);
+            let px = f64::try_from(&gts.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+            eprintln!("[seg] img{i} gt_px_total={px:.0}");
+        }
         let coef = pred_masks.get(i).transpose(0, 1).index_select(0, &nz); // (nf, nm)
         // proto 上采样到掩码分辨率（官方 bilinear）
         let proto_i: Tensor = if (proto.size()[2], proto.size()[3]) != (gh, gw) {
@@ -507,16 +515,19 @@ pub fn segmentation_mask_loss(
             mxyxy.narrow(1, 2, 1),
             mxyxy.narrow(1, 3, 1),
         );
-        // 官方 marea：归一化 xywh 的 wh 积（0.3×0.4≈0.12 量级）
-        let area = (bb.narrow(1, 2, 1) / &imgsz_f) * (bb.narrow(1, 3, 1) / &imgsz_f) + 1e-9; // (nf,1)
+        // 官方 marea = xyxy2xywh(normalized)[..., 2:].prod：归一化 (x2−x1)·(y2−y1)
+        let w_n = ((bb.narrow(1, 2, 1) - bb.narrow(1, 0, 1)) / &imgsz_f).clamp_min(0.0);
+        let h_n = ((bb.narrow(1, 3, 1) - bb.narrow(1, 1, 1)) / &imgsz_f).clamp_min(0.0);
+        let area = &w_n * &h_n + 1e-9; // (nf,1)
         // crop：bbox 外置 0
         let pr = Tensor::arange(gh, (Kind::Float, pred_mask.device())).unsqueeze(0); // (1,gh)
         let pc = Tensor::arange(gw, (Kind::Float, pred_mask.device())).unsqueeze(0);
+        // 官方 crop_mask 半开区间 [x1,x2) × [y1,y2)
         let crop = pc
             .ge_tensor(&x1)
-            .logical_and(&pc.le_tensor(&x2))
+            .logical_and(&pc.lt_tensor(&x2))
             .unsqueeze(1)
-            .logical_and(&pr.ge_tensor(&y1).logical_and(&pr.le_tensor(&y2)).unsqueeze(2))
+            .logical_and(&pr.ge_tensor(&y1).logical_and(&pr.lt_tensor(&y2)).unsqueeze(2))
             .to_kind(Kind::Float); // (nf, gh, gw)
         let nf = nz.size()[0];
         let pm_img = pred_mask.reshape([nf, gh, gw]);
@@ -528,7 +539,17 @@ pub fn segmentation_mask_loss(
         let bce = -(gt_img * (&pm_img + eps).log() + one_m * pm1.log());
         let bce = &bce * &crop;
         let per = bce.mean_dim(Some(&[1i64][..]), false, Kind::Float).mean_dim(Some(&[1i64][..]), false, Kind::Float); // (nf,)
-        loss = &loss + (per / &area).sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
+        if std::env::var("UL_LOSS_DEBUG").is_ok() {
+            let bced = bce.shallow_clone();
+            let s1 = f64::try_from(&bced.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / (gh * gw) as f64).unwrap_or(0.0);
+            let s2 = f64::try_from(&area.sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+            let per_dbg = per.shallow_clone() / area.shallow_clone();
+            let s3 = f64::try_from(&per_dbg.sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+            eprintln!("[seg] img{i} nf={} sum_bce_mean={s1:.4} sum_area={s2:.4} per_sum={s3:.4}", nz.size()[0]);
+        }
+        // area (nf,1)：显式对齐行向量，避免 (nf,)/(nf,1) 广播成矩阵
+        let per_area = per.unsqueeze(1) / &area;
+        loss = &loss + per_area.sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
     }
     let fg_t = Tensor::from_slice(&[total_fg as f32]);
     loss / &fg_t
@@ -612,19 +633,13 @@ pub fn pose_keypoints_loss(
                 let ch = pred_kpts_raw.get(i).narrow(0, kj * kpt_dim + 2, 1); // (1, A)
                 parts.push(ch);
             }
-            let pv_all = Tensor::cat(&parts, 0); // (K, A)
+            let pv_all = Tensor::cat(&parts, 0); // (K, A) 原始 logits
             let pv_fg = pv_all.transpose(0, 1).index_select(0, &nz); // (nf, K)
             let vt: Tensor = vt0.reshape([vt0.size()[0], k]).shallow_clone();
-            let pv_c = pv_fg.clamp(1e-7, 1.0 - 1e-7);
-            let ones_c: Tensor = &pv_c * 0.0 + 1.0;
-            let one_v: Tensor = &ones_c - &vt;
-            let pv1: Tensor = &ones_c - &pv_c;
-            let ones_c: Tensor = &pv_c * 0.0 + 1.0;
-            let one_v: Tensor = &ones_c - &vt;
-            let pv1: Tensor = &ones_c - &pv_c;
-            let bce = -(&vt * pv_c.log() + one_v * pv1.log());
-            let cnt = Tensor::from_slice(&[nfg as f32 * k as f32]);
-            kobj_sum = &kobj_sum + bce.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / &cnt;
+            // 官方 kobj = BCEWithLogitsLoss(原始 v logits, kpt_mask)（全元素均值）
+            let sp = pv_fg.f_softplus().unwrap();
+            let bce = &sp - &vt * &pv_fg;
+            kobj_sum = &kobj_sum + bce.sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
         }
     }
     if !any_fg {
@@ -755,7 +770,8 @@ pub fn obb_branch_loss(
     let dth = p_th - t_th;
     let pi_t = Tensor::from_slice(&[std::f32::consts::PI]);
     let dth_w = &dth - ((&dth / &pi_t).round() * &pi_t);
-    let ang = dth_w.sin().pow_tensor_scalar(2.0) * &scale_w * &weight;
+    // 官方：sin(2·Δθ_wrapped)²（注意角度先乘 2 再取 sin）
+    let ang = (dth_w * 2.0).sin().pow_tensor_scalar(2.0) * &scale_w * &weight;
     let angle_loss = ang.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / tss;
 
     let parts = LossParts {
