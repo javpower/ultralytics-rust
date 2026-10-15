@@ -140,10 +140,10 @@ CUDA：libtorch CUDA 版即可（`tch` 运行时探测），无卡自动回退 C
   **classify 训练支持目录布局数据集**（root/<class>/<img>，类按目录名排序）；
   yolo26 训练语义未与官方曲线对拍
 - **ONNX 导出**：v5-v11 标准 Detect（图内解码）+ v10/yolo26 e2e（图内两级
-  topk→(1,300,6)）+ PSA 注意力族 + **seg/pose/obb 附加通道**（seg (1,116,A)
-  含 coef、pose (1,56,A)、obb (1,85,A) 含变换角度，checker+ORT 通过）；
-  pose 的 kpt 通道导出为原始 logits（图内 (y·2+anchor−0.5)·stride 解码待完善）；
-  A2C2f（v12）显式报错（roadmap）
+  topk→(1,300,6)）+ PSA 注意力族 + **seg/pose/obb 头全图内解码**
+  （seg (1,116,A)、pose (1,56,A) 含 kpt 图内 (y·2+anchor−0.5)·stride 解码+v=σ(v)、
+  obb (1,20,A) 含 dist2rbox 旋转解码+(sigmoid−0.25)π 角度；均对拍官方
+  ≤1e-3，checker+ORT 通过）；A2C2f（v12）显式报错（roadmap）
 - **数据集缓存**：labels 解析结果持久化 cache.json（构造时全量解析一次，
   二次启动零解析；条目数不匹配自动失效重建）
 - **classify 训练**：支持目录布局数据集（data=<root>，子目录即类）；COCO 风格

@@ -19,6 +19,19 @@ struct Args {
     kvs: Vec<String>,
 }
 
+/// 模型路径解析：cwd → weights/ 目录（官方权重默认下载位置）。
+fn resolve_model_path(name: &str) -> PathBuf {
+    let p = Path::new(name);
+    if p.exists() {
+        return p.to_path_buf();
+    }
+    let alt = Path::new("weights").join(name);
+    if alt.exists() {
+        return alt;
+    }
+    p.to_path_buf()
+}
+
 fn parse_kvs(kvs: &[String]) -> std::collections::HashMap<String, String> {
     let mut m = std::collections::HashMap::new();
     for kv in kvs {
@@ -72,7 +85,9 @@ fn main() -> anyhow::Result<()> {
     };
     let _ = task;
 
-    let model_name = get("model").unwrap_or_else(|| "yolo11n".into());
+    let model_raw = get("model").unwrap_or_else(|| "yolo11n".into());
+    let model_resolved = resolve_model_path(&model_raw);
+    let model_name = model_resolved.to_string_lossy().to_string();
     let device = match get("device").as_deref() {
         Some("cpu") => tch::Device::Cpu,
         _ => tch::Device::cuda_if_available(),

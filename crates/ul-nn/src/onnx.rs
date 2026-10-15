@@ -174,6 +174,8 @@ struct G {
     nodes: Vec<Vec<u8>>,
     inits: Vec<Vec<u8>>,
     tmp: usize,
+    /// 导入尺寸（head 的 kpt 解码等需要，区别于层尺寸）
+    imgsz: i64,
 }
 
 impl G {
@@ -372,6 +374,7 @@ fn anchor_tables(imgsz: i64, strides: &[f64]) -> (Vec<f32>, Vec<f32>, i64) {
 
 /// 图内解码（官方默认导出语义，Detect._inference）：DFL 积分 + dist2bbox×strides +
 /// sigmoid 分数。标准模型输出 (1, 4+nc, A)（xywh）；e2e 输出 (1, 300, 6)（xyxy + topk）。
+#[allow(clippy::too_many_arguments)]
 fn emit_decode(
     g: &mut G,
     raw: &str,
@@ -381,6 +384,7 @@ fn emit_decode(
     strides: &[f64],
     e2e: bool,
     extra_n: i64,
+    obb: bool,
 ) -> Result<String, UlError> {
     let (anc_data, st_data, a) = anchor_tables(imgsz, strides);
 
@@ -451,10 +455,82 @@ fn emit_decode(
     g.nodes.push(node_proto("Sub", &[&x2y2, &x1y1], &[&wh], &[]));
     let dbox = g.fresh("dec.dbox");
     let dbox = if e2e {
-        // end2end：xyxy（官方 decode_bboxes xywh=not end2end → False）
         g.concat(&[x1y1, x2y2], "dec")
     } else {
         g.concat(&[cxy, wh], "dec")
+    };
+    // OBB：dist2rbox（官方 decode_bboxes with angle）——xy=旋转半差+锚点，wh=lt+rb
+    let dbox = if obb {
+        let ang = extra.as_ref().expect("obb requires angle channel");
+        let cos = g.fresh("rot.cos");
+        g.nodes.push(node_proto("Cos", &[ang], &[&cos], &[]));
+        let sin = g.fresh("rot.sin");
+        g.nodes.push(node_proto("Sin", &[ang], &[&sin], &[]));
+        let mut ch = Vec::new();
+        for k in 0..4i64 {
+            // Slice-13: starts/ends/axes 作用在通道维（axis=1）
+            let st = g.fresh(&format!("rot.ch{k}.st"));
+            g.init_i64(&st, &[1], vec![k]);
+            let en = g.fresh(&format!("rot.ch{k}.en"));
+            g.init_i64(&en, &[1], vec![k + 1]);
+            let ax = g.fresh(&format!("rot.ch{k}.ax"));
+            g.init_i64(&ax, &[1], vec![1]);
+            let stp = g.fresh(&format!("rot.ch{k}.stp"));
+            g.init_i64(&stp, &[1], vec![1]);
+            let o = g.fresh(&format!("rot.ch{k}"));
+            g.nodes.push(node_proto("Slice", &[&ltrb, &st, &en, &ax, &stp], &[&o], &[]));
+            ch.push(o);
+        }
+        let (l, t, r, b) = (&ch[0], &ch[1], &ch[2], &ch[3]);
+        let half = g.fresh("rot.half");
+        g.init_f32_data(&half, &[], vec![0.5]);
+        let xh = g.fresh("rot.xh");
+        g.nodes.push(node_proto("Sub", &[r, l], &[&xh], &[]));
+        let xf = g.fresh("rot.xf");
+        g.nodes.push(node_proto("Mul", &[&xh, &half], &[&xf], &[]));
+        let yh = g.fresh("rot.yh");
+        g.nodes.push(node_proto("Sub", &[b, t], &[&yh], &[]));
+        let yf = g.fresh("rot.yf");
+        g.nodes.push(node_proto("Mul", &[&yh, &half], &[&yf], &[]));
+        // anc (1,2,A) → x/y 通道（Slice 索引须一维：anc_flat=[x(2100), y(2100)]）
+        let anc_f = g.reshape(&anc, &[-1], "rot.anc_f");
+        let ax1 = g.fresh("rot.ax1");
+        g.init_i64(&ax1, &[1], vec![0]);
+        let st_x = g.fresh("rot.stx");
+        g.init_i64(&st_x, &[1], vec![0]);
+        let en_x = g.fresh("rot.enx");
+        g.init_i64(&en_x, &[1], vec![a]);
+        let anc_x = g.fresh("rot.anc_x");
+        g.nodes.push(node_proto("Slice", &[&anc_f, &st_x, &en_x, &ax1], &[&anc_x], &[]));
+        let st_y = g.fresh("rot.sty");
+        g.init_i64(&st_y, &[1], vec![a]);
+        let en_y = g.fresh("rot.eny");
+        g.init_i64(&en_y, &[1], vec![2 * a]);
+        let anc_y = g.fresh("rot.anc_y");
+        g.nodes.push(node_proto("Slice", &[&anc_f, &st_y, &en_y, &ax1], &[&anc_y], &[]));
+        let xc = g.fresh("rot.xc");
+        g.nodes.push(node_proto("Mul", &[&xf, &cos], &[&xc], &[]));
+        let ys = g.fresh("rot.ys");
+        g.nodes.push(node_proto("Mul", &[&yf, &sin], &[&ys], &[]));
+        let yc = g.fresh("rot.yc");
+        g.nodes.push(node_proto("Mul", &[&yf, &cos], &[&yc], &[]));
+        let xs = g.fresh("rot.xs");
+        g.nodes.push(node_proto("Mul", &[&xf, &sin], &[&xs], &[]));
+        let x1 = g.fresh("rot.x1");
+        g.nodes.push(node_proto("Add", &[&xc, &anc_x], &[&x1], &[]));
+        let x = g.fresh("rot.x");
+        g.nodes.push(node_proto("Sub", &[&x1, &ys], &[&x], &[]));
+        let y1 = g.fresh("rot.y1");
+        g.nodes.push(node_proto("Add", &[&yc, &anc_y], &[&y1], &[]));
+        let y = g.fresh("rot.y");
+        g.nodes.push(node_proto("Add", &[&y1, &xs], &[&y], &[]));
+        let w = g.fresh("rot.w");
+        g.nodes.push(node_proto("Add", &[l, r], &[&w], &[]));
+        let h = g.fresh("rot.h");
+        g.nodes.push(node_proto("Add", &[t, b], &[&h], &[]));
+        g.concat(&[x, y, w, h], "rot.box")
+    } else {
+        dbox
     };
     let dbox_px = g.fresh("dec.dbox_px");
     g.nodes.push(node_proto("Mul", &[&dbox, &st], &[&dbox_px], &[]));
@@ -542,7 +618,7 @@ fn emit_decode(
 
 /// 导出入口。输出为官方默认导出语义的解码结果 (1, 4+nc, A)：xywh 像素 + sigmoid 分数。
 pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std::path::PathBuf, UlError> {
-    let mut g = G { nodes: vec![], inits: vec![], tmp: 0 };
+    let mut g = G { nodes: vec![], inits: vec![], tmp: 0, imgsz: imgsz as i64 };
     let input_name = "images".to_string();
     let mut cur = input_name.clone();
 
@@ -591,8 +667,13 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
             _ => Some(0),
         })
         .unwrap_or(0);
+    let is_obb = matches!(
+        model.layers.last().map(|l| &l.module),
+        Some(Module::Head(crate::parse::HeadMod::Detect(dh)))
+            if matches!(dh.kind, crate::head::ExtraKind::Angle | crate::head::ExtraKind::Angle26)
+    );
     let out_name = if last_is_detect {
-        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride, model.end2end, extra_n)?
+        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride, model.end2end, extra_n, is_obb)?
     } else {
         cur.clone()
     };
@@ -677,7 +758,7 @@ fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str, hw: (i64, i6
             g.conv_bn(&format!("{p}.cv2"), &a, &sd.cv2)
         }
         Module::Head(hm) => match hm {
-            crate::parse::HeadMod::Detect(dh) => return emit_detect_head(g, dh, inputs, p, hw.0),
+            crate::parse::HeadMod::Detect(dh) => return emit_detect_head(g, dh, inputs, p),
             _ => return bail("onnx export: classify/semseg head on roadmap"),
         },
         other => {
@@ -873,7 +954,7 @@ fn emit_bottleneck(g: &mut G, p: &str, x: &str, bn: &Bottleneck) -> String {
 }
 
 /// 检测头：cv2/cv3 → cat → (1, 4+nc, A)。e2e 模型发射 one2one 分支（官方导出语义）。
-fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], p: &str, _imgsz: i64) -> Result<String, UlError> {
+fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], p: &str) -> Result<String, UlError> {
     let empty: Vec<crate::head::Branch> = Vec::new();
     let (cv2r, cv3r) = if dh.end2end {
         (dh.o2o_cv2.as_ref().unwrap_or(&dh.cv2), dh.o2o_cv3.as_ref().unwrap_or(&dh.cv3))
@@ -930,7 +1011,7 @@ fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], 
             crate::head::ExtraKind::Kpt => dh.nk(),
             crate::head::ExtraKind::Angle | crate::head::ExtraKind::Angle26 => dh.ne,
             _ => 0,
-        }, p, mode, &dh.stride, _imgsz));
+        }, p, mode, &dh.stride, g.imgsz));
     }
     Ok(main)
 }
@@ -979,7 +1060,94 @@ fn emit_cv4_concat(
     g.nodes.push(node_proto("Concat", &refs, &[&cat], &[("axis", AttrVal::I(-1))]));
     let cat_ref = cat.clone();
     parts.push(cat);
-    // Angle：变换 (sigmoid−0.25)·π
+    // Pose：kpt 图内解码（官方 kpts_decode）：
+    //   view(1,17,3,A) → xy=(y·2+anchor−0.5)·stride，v=σ(v) → view(1,51,A)
+    if let Cv4Mode::Pose { k, ndim } = mode {
+        let a_total: i64 = strides
+            .iter()
+            .map(|sv| {
+                let n = imgsz / (*sv as i64);
+                n * n
+            })
+            .sum();
+        let _ = k;
+        let rs = g.fresh(&format!("{p}.kd.view"));
+        g.init_i64(&rs, &[4], vec![1, k, ndim, a_total]);
+        let viewed = g.fresh(&format!("{p}.kd.v"));
+        g.nodes.push(node_proto("Reshape", &[&cat_ref, &rs], &[&viewed], &[]));
+        // 切 xy (1,17,2,A) 与 v (1,17,1,A)
+        let sl = g.fresh(&format!("{p}.kd.sl"));
+        g.init_i64(&sl, &[8], vec![0, 0, 0, 0, 0, 0, 2, 0]);
+        let ends = g.fresh(&format!("{p}.kd.en"));
+        g.init_i64(&ends, &[8], vec![0, 0, 0, 0, 0, 0, 2, 0]);
+        // Slice-13: inputs starts/ends/axes/steps
+        let starts_n = g.fresh(&format!("{p}.kd.st"));
+        g.init_i64(&starts_n, &[4], vec![0, 0, 0, 0]);
+        let ends_n = g.fresh(&format!("{p}.kd.en2"));
+        g.init_i64(&ends_n, &[4], vec![1 << 30, 1 << 30, 2, 1 << 30]);
+        let axes_n = g.fresh(&format!("{p}.kd.ax"));
+        g.init_i64(&axes_n, &[4], vec![0, 1, 2, 3]);
+        let steps_n = g.fresh(&format!("{p}.kd.stp"));
+        g.init_i64(&steps_n, &[4], vec![1, 1, 1, 1]);
+        let xy = g.fresh(&format!("{p}.kd.xy"));
+        g.nodes.push(node_proto(
+            "Slice",
+            &[&viewed, &starts_n, &ends_n, &axes_n, &steps_n],
+            &[&xy],
+            &[],
+        ));
+        let starts_v = g.fresh(&format!("{p}.kd.stv"));
+        g.init_i64(&starts_v, &[4], vec![0, 0, 2, 0]);
+        let ends_v = g.fresh(&format!("{p}.kd.env"));
+        g.init_i64(&ends_v, &[4], vec![1 << 30, 1 << 30, 3, 1 << 30]);
+        let vv = g.fresh(&format!("{p}.kd.v"));
+        g.nodes.push(node_proto(
+            "Slice",
+            &[&viewed, &starts_v, &ends_v, &axes_n, &steps_n],
+            &[&vv],
+            &[],
+        ));
+        // anchors (1,1,2,A) 与 strides (1,1,1,A) initializer
+        let (anc_data, _, _) = anchor_tables(imgsz, strides);
+        let anc = g.fresh(&format!("{p}.kd.anc"));
+        g.init_f32_data(&anc, &[1, 1, 2, a_total], anc_data);
+        let stm = g.fresh(&format!("{p}.kd.stm"));
+        let mut st_flat = Vec::new();
+        for sv in strides {
+            let n = imgsz / (*sv as i64);
+            for _ in 0..n * n {
+                st_flat.push(*sv as f32);
+            }
+        }
+        g.init_f32_data(&stm, &[1, 1, 1, a_total], st_flat);
+        // xy = (xy·2 + anchor − 0.5)·stride
+        let two = g.fresh(&format!("{p}.kd.two"));
+        g.init_f32_data(&two, &[], vec![2.0]);
+        let xy2 = g.fresh(&format!("{p}.kd.xy2"));
+        g.nodes.push(node_proto("Mul", &[&xy, &two], &[&xy2], &[]));
+        let a2 = g.fresh(&format!("{p}.kd.a2"));
+        g.nodes.push(node_proto("Add", &[&xy2, &anc], &[&a2], &[]));
+        let half = g.fresh(&format!("{p}.kd.half"));
+        g.init_f32_data(&half, &[], vec![0.5]);
+        let a3 = g.fresh(&format!("{p}.kd.a3"));
+        g.nodes.push(node_proto("Sub", &[&a2, &half], &[&a3], &[]));
+        let dec = g.fresh(&format!("{p}.kd.dec"));
+        g.nodes.push(node_proto("Mul", &[&a3, &stm], &[&dec], &[]));
+        // v = σ(v)
+        let vs = g.fresh(&format!("{p}.kd.vs"));
+        g.nodes.push(node_proto("Sigmoid", &[&vv], &[&vs], &[]));
+        // cat [xy, v] dim2 → view (1,51,A) → 替换 parts 尾部
+        let cat2 = g.fresh(&format!("{p}.kd.cat"));
+        g.nodes.push(node_proto("Concat", &[&dec, &vs], &[&cat2], &[("axis", AttrVal::I(2))]));
+        let rs2 = g.fresh(&format!("{p}.kd.back"));
+        g.init_i64(&rs2, &[3], vec![1, k * ndim, a_total]);
+        let back = g.fresh(&format!("{p}.kd.backv"));
+        g.nodes.push(node_proto("Reshape", &[&cat2, &rs2], &[&back], &[]));
+        if let Some(last) = parts.last_mut() {
+            *last = back;
+        }
+    }
+    // Angle：变换 (sigmoid−0.25)·π 并替换 parts 尾部的 raw logits
     if let Cv4Mode::Angle = mode {
         let sig = g.fresh(&format!("{p}.ang.sig"));
         g.nodes.push(node_proto("Sigmoid", &[&cat_ref], &[&sig], &[]));
@@ -991,11 +1159,9 @@ fn emit_cv4_concat(
         g.init_f32_data(&piv, &[], vec![std::f32::consts::PI]);
         let out_a = g.fresh(&format!("{p}.ang.out"));
         g.nodes.push(node_proto("Mul", &[&shifted, &piv], &[&out_a], &[]));
-        let out = g.fresh(&format!("{p}.with_extra"));
-        let pr: Vec<&str> = parts.iter().map(|x| x.as_str()).collect();
-        let o = g.fresh(&format!("{p}.with_extra"));
-        g.nodes.push(node_proto("Concat", &pr, &[&o], &[("axis", AttrVal::I(1))]));
-        return o;
+        if let Some(last) = parts.last_mut() {
+            *last = out_a;
+        }
     }
     let out = g.fresh(&format!("{p}.with_extra"));
     let pr: Vec<&str> = parts.iter().map(|x| x.as_str()).collect();
