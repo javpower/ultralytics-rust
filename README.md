@@ -46,7 +46,10 @@ yolo26-depth（TorchVision 桥）、SAVPE。
 | **v8DetectionLoss 三分量 vs 官方 8.4.157**（同输入同权重，`loss_parity.rs`） | **box 6.6e-5 / cls 2.2e-4 / dfl 4.6e-5 相对差**；TAL 分配 fg=44 一致、target_scores_sum 7.874 vs 7.877 |
 | COCO 评测：compute_ap 对拍 numpy 真值（trapz 梯形积分语义） | 完美预测 0.995 精确一致 |
 | 全系列构建+前向 | 48/48 |
-| **ONNX 导出（v8 全路径，图内 DFL+dist2bbox+sigmoid）** | onnx.checker 通过；onnxruntime 对拍官方 eval 前向：320→(1,84,2100) **max_diff 6.4e-4**，640→(1,84,8400) **9.5e-4** |
+| **ONNX 导出（v5-v11 全路径，图内 DFL+dist2bbox+sigmoid）** | onnx.checker 通过；onnxruntime 对拍官方 eval 前向：yolov8n 320→(1,84,2100) **max_diff 6.4e-4**、640→(1,84,8400) **9.5e-4**；yolo11n（含 C2PSA 注意力）**7.8e-4** |
+| **ONNX e2e 导出（v10/yolo26，图内两级 topk → (1,300,6)）** | checker + onnxruntime 通过；分数降序、值域校验 ✓（官方 v10 权重资产缺失，数值对拍以 y8/y11 为准） |
+| **四任务训练闭环**（detect/segment/pose/obb） | 合成标签冒烟全部收敛运行：seg 走 BCE/crop/area 掩码损失，pose 走 OKS 式 KeypointLoss+kobj BCE，obb 走旋转 TAL+probiou+rbox2dist+角度损失 |
+| **评测覆盖** | detect=box AP；seg=mask IoU AP；pose=OKS AP；obb=probiou AP（官方 match_predictions/ap_per_class 语义） |
 | coco8 训练冒烟（30 epoch，自动 AdamW，默认增强） | best mAP50-95 = **0.381**（修复前 0.376）；关增强直训 0.399 |
 
 ## 与官方的能力对齐
@@ -73,10 +76,21 @@ yolo26-depth（TorchVision 桥）、SAVPE。
   HSV（真 HSV 转换）/ fliplr（COCO17 关键点交换表）/ flipud / BGR / close_mosaic /
   letterbox（114 灰边）；以上 14 项超参全部经 CLI 透传
 - **评测**：COCO 10 档 IoU + trapz 101 点插值 + smooth-F1 最优点 P/R（ap_per_class 忠实移植）
-- **训练器**：auto 优化器（total_iters≤10000 → AdamW+lr_fit，否则 SGD）、
+- **训练器**：官方三参数组（bias 无 wd+warmup_bias_lr=0.1 起步 / norm 无 wd /
+  weight 有 wd×batch÷nbs）手写 SGD+AdamW（含 AdamW 解耦 wd、bias correction）、
+  nbs 梯度累积（每 max(1,⌈nbs/batch⌉) 步 clip+step）、multi-scale（[0.5,1.5]×imgsz 32 对齐）、
+  auto 优化器（total_iters≤10000 → AdamW+lr_fit，否则 SGD）、
   warmup（lr 0→lr0、momentum 0.8→目标）、线性/余弦调度、裁剪 grad=10、
   EMA 逐迭代 ramp（0.9999·(1−e^(−i/2000))）、close_mosaic 末段关闭、
-  fitness 最优检查点 + patience 早停 + metrics.jsonl（box/cls/dfl 分量）
+  fitness 最优检查点 + patience 早停 + metrics.jsonl（box/cls/dfl 等分量）
+- **任务损失**：v8SegmentationLoss（proto 双线性上采样 + einsum 掩码 +
+  bbox 裁剪 BCE/面积 ÷fg 数，×box gain）、v8PoseLoss（格单位 kpt 解码 +
+  KeypointLoss((2σ)²·area·2) + kobj BCE，×pose=12/kobj=1）、v8OBBLoss
+  （RotatedTaskAlignedAssigner 角点投影 + probiou(floor=0.01) + rbox2dist DFL +
+  sin²(2Δθ)·宽高比权重角度损失，×angle=1）
+- **任务评测**：seg=掩码 IoU 矩阵 AP（proto@coef 上采样 + bbox 裁剪）、
+  pose=OKS 矩阵 AP（COCO17 σ）、obb=probiou 矩阵 AP；均走官方
+  match_predictions（10 档 IoU）+ ap_per_class
 
 ## 权重入口
 
@@ -113,21 +127,21 @@ CUDA：libtorch CUDA 版即可（`tch` 运行时探测），无卡自动回退 C
 
 ## 已知边界（诚实清单）
 
-- **训练侧未实现**：AMP（fp16 autocast）、多卡 DDP、rect（最小矩形）训练与推理、
-  官方的三参数组 bias/weight/norm 差分 lr 与 warmup_bias_lr=0.1（当前单组 lr）
+- **训练侧未实现**：AMP（fp16 autocast）、多卡 DDP、rect（最小矩形）训练与推理
 - **增强未实现**：copy_paste、erasing、cutout（mosaic/mixup/透视/HSV/翻转/BGR/
   close_mosaic 已实现且可透传）
-- **任务面**：训练闭环覆盖 detect + classify；seg/pose/obb 有前向与权重加载、
-  损失/训练分支未接；evaluate 只到 detect 家族
-- **ONNX 导出**：仅 v5/v8/v9/v10 卷积全路径 + 标准 Detect 头（图内解码，
-  官方默认导出语义）；end2end（v10/yolo26）图内 topk 后处理未实现——显式报错
-  （用 `format=safetensors`）；classify/semseg/PSA 注意力模块显式报错
-- **e2e 双头训练**：one2one 分支 detach 主干 + 独立 topk=1 分配器已对齐
-  E2EDetectLoss；yolo26（reg_max=1）的 dfl 槽走归一化 L1（对齐官方 use_dfl=False
-  分支），但其全量训练语义（含官方可能的额外一致化项）未与官方 trainer 对拍过
+- **任务面**：detect/classify/segment/pose/obb 训练+评测闭环全通；但 seg/pose/obb
+  的损失**只做了合成数据冒烟，尚未像 detect 那样做逐分量官方数值对拍**
+  （loss_parity 覆盖 v8DetectionLoss 三分量）；yolo26（reg_max=1）的 L1 路径、
+  Segment26/Pose26/OBB26 的 e2e 训练语义未与官方 trainer 曲线对拍
+- **ONNX 导出**：detect 家族全覆盖——v5-v11 标准 Detect（图内解码）+ v10/yolo26
+  e2e（图内两级 topk→(1,300,6)）+ PSA 注意力族（Psa/C2PSA/C2fPSA/BottleneckPsa）；
+  seg/pose/obb 头导出与 A2C2f（v12）显式报错（roadmap）；v10 官方权重资产缺失，
+  e2e 数值对拍以图结构 + ORT 校验为准
+- **曲线级对拍**：与官方 trainer 的逐 epoch 收敛对比脚本见
+  `scripts/curve_parity.py`（同参数同数据双方训练），尚未跑 COCO 全量基准
 - **pickle VM**：支持 torch.save 协议 2-4 的 torch 标准子集；
   `.pt` 若含非常规 opcode 会显式报错（不支持静默错位）
-- **评测**：仅 box 指标（mAP/P/R）；seg/pose/obb 指标未实现
 
 ## 许可
 

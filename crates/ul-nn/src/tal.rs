@@ -35,6 +35,20 @@ pub struct AssignOut {
 }
 
 impl TaskAlignedAssigner {
+    /// 旋转框分配（官方 RotatedTaskAlignedAssigner）：pd/gt 均为 xywhr 像素 (bs, A/m, 5)。
+    pub fn assign_rotated(
+        &self,
+        pd_scores: &Tensor,
+        pd_xywhr: &Tensor,
+        anc_points: &Tensor,
+        gt_labels: &Tensor,
+        gt_xywhr: &Tensor,
+        mask_gt: &Tensor,
+    ) -> AssignOut {
+        let dummy = Tensor::zeros([1, 1, 4], (Kind::Float, pd_xywhr.device()));
+        self.assign_impl(pd_scores, Some(pd_xywhr), &dummy, anc_points, gt_labels, gt_xywhr, mask_gt)
+    }
+
     /// pd_scores: (bs, A, nc) 已 sigmoid；pd_bboxes: (bs, A, 4) xyxy 像素；
     /// anc_points: (2, A)；gt_labels: (bs, m, 1)；gt_bboxes: (bs, m, 4) xyxy 像素；
     /// mask_gt: (bs, m, 1) bool。
@@ -47,15 +61,32 @@ impl TaskAlignedAssigner {
         gt_bboxes: &Tensor,
         mask_gt: &Tensor,
     ) -> AssignOut {
+        self.assign_impl(pd_scores, None, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assign_impl(
+        &self,
+        pd_scores: &Tensor,
+        pd_xywhr: Option<&Tensor>,
+        pd_bboxes: &Tensor,
+        anc_points: &Tensor,
+        gt_labels: &Tensor,
+        gt_bboxes: &Tensor,
+        mask_gt: &Tensor,
+    ) -> AssignOut {
+        let rotated = pd_xywhr.is_some();
+        let pd_bboxes: &Tensor = pd_xywhr.unwrap_or(pd_bboxes);
         let bs = pd_bboxes.size()[0];
         let na = pd_bboxes.size()[1];
         let m = gt_bboxes.size()[1];
         let device = pd_bboxes.device();
+        let gw = gt_bboxes.size()[2]; // 4 = xyxy / 5 = xywhr
 
         if m == 0 {
             return AssignOut {
                 target_labels: Tensor::full([bs, na], self.num_classes as f64, (Kind::Int64, device)),
-                target_bboxes: Tensor::zeros([bs, na, 4], (Kind::Float, device)),
+                target_bboxes: Tensor::zeros([bs, na, gw], (Kind::Float, device)),
                 target_scores: Tensor::zeros([bs, na, self.num_classes], (Kind::Float, device)),
                 fg_mask: Tensor::zeros([bs, na], (Kind::Bool, device)),
                 target_gt_idx: Tensor::zeros([bs, na], (Kind::Int64, device)),
@@ -63,9 +94,13 @@ impl TaskAlignedAssigner {
         }
 
         // 1) 框内锚 + 对齐指标（(bs, m, A)）
-        let mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt);
+        let mask_in_gts = if rotated {
+            self.select_candidates_in_gts_rotated(anc_points, gt_bboxes, mask_gt)
+        } else {
+            self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
+        };
         let (mut align_metric, mut overlaps) =
-            self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, &(mask_in_gts.to_kind(Kind::Bool) * mask_gt));
+            self.get_box_metrics_impl(pd_scores, pd_bboxes, gt_labels, gt_bboxes, &(mask_in_gts.to_kind(Kind::Bool) * mask_gt), rotated);
 
         // 2) topk 候选（每 gt 取 align 最高的 topk 锚；重复命中置 0）
         let topk_mask = mask_gt.expand([bs, m, self.topk], true);
@@ -101,6 +136,37 @@ impl TaskAlignedAssigner {
         }
     }
 
+    /// 旋转框内锚掩码（官方 corner 投影法）：wh<stride_val 放大后 → 四角点 → 锚点投影判内。
+    fn select_candidates_in_gts_rotated(&self, anc_points: &Tensor, gt_xywhr: &Tensor, mask_gt: &Tensor) -> Tensor {
+        let bs = gt_xywhr.size()[0];
+        let m = gt_xywhr.size()[1];
+        let a = anc_points.size()[1];
+        // 小框放大：wh < stride_val → stride_val
+        let wh = gt_xywhr.narrow(2, 2, 2);
+        let small = wh.lt(self.stride_val).logical_and(&mask_gt.to_kind(Kind::Bool));
+        let wh_fixed = small.to_kind(Kind::Float) * self.stride_val + (1.0 - small.to_kind(Kind::Float)) * wh;
+        let gt = Tensor::cat(&[gt_xywhr.narrow(2, 0, 2).shallow_clone(), wh_fixed, gt_xywhr.narrow(2, 4, 1).shallow_clone()], 2);
+        // 逐 gt 求角点（(bs, m, 8)），再投影判定
+        let corners = rotated_corners_batched(&gt); // (bs, m, 4, 2): a, b, d(?), 顺序 p0 p1 p3
+        let pa = corners.select(2, 0);
+        let pb = corners.select(2, 1);
+        let pd = corners.select(2, 3);
+        let ab = &pb - &pa; // (bs, m, 2)
+        let ad = &pd - &pa;
+        let apx = anc_points.get(0).to_kind(Kind::Float).reshape([1, 1, a]) - pa.select(2, 0).unsqueeze(2); // (bs, m, A)
+        let apy = anc_points.get(1).to_kind(Kind::Float).reshape([1, 1, a]) - pa.select(2, 1).unsqueeze(2);
+        let norm_ab = (&ab.select(2, 0) * &ab.select(2, 0) + &ab.select(2, 1) * &ab.select(2, 1)).unsqueeze(2); // (bs, m, 1)
+        let norm_ad = (&ad.select(2, 0) * &ad.select(2, 0) + &ad.select(2, 1) * &ad.select(2, 1)).unsqueeze(2);
+        let ap_dot_ab = &apx * &ab.select(2, 0).unsqueeze(2) + &apy * &ab.select(2, 1).unsqueeze(2);
+        let ap_dot_ad = &apx * &ad.select(2, 0).unsqueeze(2) + &apy * &ad.select(2, 1).unsqueeze(2);
+        let az = &ap_dot_ab * 0.0;
+        let dz = &ap_dot_ad * 0.0;
+        (ap_dot_ab.ge_tensor(&az))
+            .logical_and(&ap_dot_ab.le_tensor(&norm_ab))
+            .logical_and(&ap_dot_ad.ge_tensor(&dz))
+            .logical_and(&ap_dot_ad.le_tensor(&norm_ad))
+    }
+
     /// 框内锚掩码（含小框放大到 stride_val），返回 (bs, m, A) bool。
     fn select_candidates_in_gts(&self, anc_points: &Tensor, gt_bboxes: &Tensor, mask_gt: &Tensor) -> Tensor {
         let bs = gt_bboxes.size()[0];
@@ -134,13 +200,14 @@ impl TaskAlignedAssigner {
     }
 
     /// 对齐指标（稀疏计算，官方 indices 语义），返回 (bs, m, A)。
-    fn get_box_metrics(
+    fn get_box_metrics_impl(
         &self,
         pd_scores: &Tensor,
         pd_bboxes: &Tensor,
         gt_labels: &Tensor,
         gt_bboxes: &Tensor,
         mask: &Tensor, // (bs, m, A) bool
+        rotated: bool,
     ) -> (Tensor, Tensor) {
         let bs = pd_bboxes.size()[0];
         let na = pd_bboxes.size()[1];
@@ -166,8 +233,12 @@ impl TaskAlignedAssigner {
         let scores_sel = batched_select3(&ps, &b_idx, &lbl_k, &a_idx);
         let gt_sel = batched_select2(gt_bboxes, &b_idx, &g_idx); // (K, 4)
         let pd_sel = batched_select2(pd_bboxes, &b_idx, &a_idx); // (K, 4)
-        // 成对 CIoU（K 对）；官方 iou_calculation 末尾 clamp_(0)（负 CIoU 在 ^β 下会翻正）
-        let ov = crate::ops::bbox_iou_pairwise(&gt_sel, &pd_sel, true).squeeze_dim(1).clamp_min(0.0); // (K,)
+        // 成对 IoU；官方 iou_calculation 末尾 clamp_(0)（负值在 ^β 下会翻正）
+        let ov = if rotated {
+            crate::ops::probiou_pairwise(&gt_sel, &pd_sel, false, 0.0).squeeze_dim(1).clamp_min(0.0)
+        } else {
+            crate::ops::bbox_iou_pairwise(&gt_sel, &pd_sel, true).squeeze_dim(1).clamp_min(0.0)
+        }; // (K,)
         let align_vals = scores_sel.pow_tensor_scalar(self.alpha) * ov.pow_tensor_scalar(self.beta);
 
         // 两个独立零张量：shallow_clone 共享存储会让 overlaps/align 相互覆盖
@@ -253,10 +324,11 @@ impl TaskAlignedAssigner {
             .index_select(0, &flat)
             .reshape([bs, a])
             .clamp(0, self.num_classes - 1);
+        let gw = gt_bboxes.size()[2];
         let target_bboxes = gt_bboxes
-            .reshape([-1, 4])
+            .reshape([-1, gw])
             .index_select(0, &flat)
-            .reshape([bs, a, 4]);
+            .reshape([bs, a, gw]);
         let onehot = one_hot_i64(&target_labels, self.num_classes);
         let target_scores = onehot * fg_mask.gt(0.0).to_kind(Kind::Float).unsqueeze(2);
         (target_labels, target_bboxes, target_scores)
@@ -300,10 +372,11 @@ fn batched_select3(t: &Tensor, b: &Tensor, y: &Tensor, x: &Tensor) -> Tensor {
     picked_y.gather(1, &x.reshape([-1, 1]), false).squeeze_dim(1)
 }
 
-/// (bs, X, 4) 按二元组取行 → (K, 4)。
+/// (bs, X, W) 按二元组取行 → (K, W)（W 自适应：detect 4 / obb 5）。
 fn batched_select2(t: &Tensor, b: &Tensor, x: &Tensor) -> Tensor {
-    let sel = t.index_select(0, b); // (K, X, 4)
-    sel.gather(1, &x.reshape([-1, 1, 1]).expand([-1, 1, 4], true), false).squeeze_dim(1)
+    let w = t.size()[2];
+    let sel = t.index_select(0, b); // (K, X, W)
+    sel.gather(1, &x.reshape([-1, 1, 1]).expand([-1, 1, w], true), false).squeeze_dim(1)
 }
 
 trait AmaxLast {
@@ -314,4 +387,26 @@ impl AmaxLast for Tensor {
     fn amax_last(&self, dim: i64, keepdim: bool) -> Tensor {
         self.f_amax(&[dim], keepdim).unwrap()
     }
+}
+
+/// (bs, m, 5) xywhr → (bs, m, 4, 2) 四角点（p0..p3 绕行）。
+fn rotated_corners_batched(whr: &Tensor) -> Tensor {
+    let (xc, yc) = (whr.narrow(2, 0, 1), whr.narrow(2, 1, 1));
+    let cos = whr.narrow(2, 4, 1).cos();
+    let sin = whr.narrow(2, 4, 1).sin();
+    let (w, h) = (whr.narrow(2, 2, 1), whr.narrow(2, 3, 1));
+    let (ux, uy) = (&w * &cos, &w * &sin);
+    let (vx, vy) = (-&h * &sin, &h * &cos);
+    let mk = |sx: &Tensor, sy: &Tensor| -> Tensor {
+        let px = &xc + &ux * sx + &vx * sy;
+        let py = &yc + &uy * sx + &vy * sy;
+        Tensor::stack(&[px.squeeze_dim(2), py.squeeze_dim(2)], 2)
+    };
+    let neg1 = -1.0 * Tensor::ones_like(&xc);
+    let pos1 = Tensor::ones_like(&xc);
+    let p0 = mk(&neg1, &neg1);
+    let p1 = mk(&pos1, &neg1);
+    let p2 = mk(&pos1, &pos1);
+    let p3 = mk(&neg1, &pos1);
+    Tensor::stack(&[p0, p1, p2, p3], 2)
 }

@@ -213,6 +213,10 @@ impl Augmentor {
                     k[0] = (k[0] * nw as f32 + ox as f32) / (2 * s) as f32;
                     k[1] = (k[1] * nh as f32 + oy as f32) / (2 * s) as f32;
                 }
+                for pt in ins.segments.chunks_exact_mut(2) {
+                    pt[0] = (pt[0] * nw as f32 + ox as f32) / (2 * s) as f32;
+                    pt[1] = (pt[1] * nh as f32 + oy as f32) / (2 * s) as f32;
+                }
                 instances.push(ins);
             }
         }
@@ -232,6 +236,10 @@ impl Augmentor {
             for k in ins.kpts.chunks_exact_mut(3) {
                 k[0] = (k[0] * 2.0 * s as f32 - xc as f32) / s as f32;
                 k[1] = (k[1] * 2.0 * s as f32 - yc as f32) / s as f32;
+            }
+            for pt in ins.segments.chunks_exact_mut(2) {
+                pt[0] = (pt[0] * 2.0 * s as f32 - xc as f32) / s as f32;
+                pt[1] = (pt[1] * 2.0 * s as f32 - yc as f32) / s as f32;
             }
         }
         // 裁剪后剔除出界的框
@@ -384,11 +392,24 @@ pub fn random_perspective(
         [xr / den / s, yr / den / s]
     };
     for ins in &mut sample.instances {
-        let pts = to_px(ins);
-        let c = apply(pts[0]);
-        let p1 = apply(pts[1]);
-        let p2 = apply(pts[2]);
-        ins.xywhn = [c[0], c[1], (p2[0] - p1[0]).abs(), (p2[1] - p1[1]).abs()];
+        // 多边形逐点变换（分割），随后由外接框重建 bbox（官方：bbox 由 segments 派生）
+        if !ins.segments.is_empty() {
+            for pt in ins.segments.chunks_exact_mut(2) {
+                let p = apply([pt[0], pt[1]]);
+                pt[0] = p[0];
+                pt[1] = p[1];
+            }
+            let pts = polygon_parts(&ins.segments);
+            let (x0, x1) = (pts.iter().map(|p| p[0]).fold(f32::MAX, f32::min), pts.iter().map(|p| p[0]).fold(f32::MIN, f32::max));
+            let (y0, y1) = (pts.iter().map(|p| p[1]).fold(f32::MAX, f32::min), pts.iter().map(|p| p[1]).fold(f32::MIN, f32::max));
+            ins.xywhn = [(x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0];
+        } else {
+            let pts = to_px(ins);
+            let c = apply(pts[0]);
+            let p1 = apply(pts[1]);
+            let p2 = apply(pts[2]);
+            ins.xywhn = [c[0], c[1], (p2[0] - p1[0]).abs(), (p2[1] - p1[1]).abs()];
+        }
         for k in ins.kpts.chunks_exact_mut(3) {
             let kp = apply([k[0], k[1]]);
             k[0] = kp[0];
@@ -495,6 +516,9 @@ pub fn flip_ud(sample: &mut Sample) {
     sample.img = flipped;
     for ins in &mut sample.instances {
         ins.xywhn[1] = 1.0 - ins.xywhn[1];
+        for pt in ins.segments.chunks_exact_mut(2) {
+            pt[1] = 1.0 - pt[1];
+        }
         for k in ins.kpts.chunks_exact_mut(3) {
             k[1] = 1.0 - k[1];
         }
@@ -514,6 +538,9 @@ pub fn flip_lr(sample: &mut Sample) {
     sample.img = flipped;
     for ins in &mut sample.instances {
         ins.xywhn[0] = 1.0 - ins.xywhn[0];
+        for pt in ins.segments.chunks_exact_mut(2) {
+            pt[0] = 1.0 - pt[0];
+        }
         if ins.kpt_dim >= 2 {
             const SWAP: [usize; 17] = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15];
             let nd = ins.kpt_dim as usize;
@@ -549,6 +576,55 @@ pub fn letterbox(img: &Img, new_size: u32, color: [u8; 3]) -> Img {
         for x in 0..nw as i32 {
             let p = resized.pixel(x as u32, y as u32);
             out.set_pixel((x + ox) as u32, (y + oy) as u32, p);
+        }
+    }
+    out
+}
+
+/// 多边形展平数组 → 顶点对。
+pub fn polygon_parts(seg: &[f32]) -> Vec<[f32; 2]> {
+    seg.chunks_exact(2).map(|c| [c[0], c[1]]).collect()
+}
+
+/// 把样本的多边形按实例顺序光栅化为 (imgsz×imgsz) 掩码，像素值 = 实例序号+1（0=背景）。
+/// 语义对齐官方 overlap=True 的合并掩码（后画覆盖先画）。
+pub fn rasterize_mask(sample: &Sample, imgsz: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (imgsz * imgsz) as usize];
+    for (idx, ins) in sample.instances.iter().enumerate() {
+        if ins.segments.len() < 6 {
+            continue;
+        }
+        let pts: Vec<[f32; 2]> = ins
+            .segments
+            .chunks_exact(2)
+            .map(|c| [c[0] * imgsz as f32, c[1] * imgsz as f32])
+            .collect();
+        let n = pts.len();
+        // 扫描线：每行求交点并填充跨段
+        for yy in 0..imgsz as i32 {
+            let y = yy as f32 + 0.5;
+            let mut xs: Vec<f32> = Vec::new();
+            for i in 0..n {
+                let a = pts[i];
+                let b = pts[(i + 1) % n];
+                if (a[1] <= y && b[1] > y) || (b[1] <= y && a[1] > y) {
+                    let t = (y - a[1]) / (b[1] - a[1]);
+                    xs.push(a[0] + t * (b[0] - a[0]));
+                }
+            }
+            xs.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+            for pair in xs.chunks(2) {
+                if pair.len() < 2 {
+                    continue;
+                }
+                let x0 = pair[0].max(0.0) as i32;
+                let x1 = (pair[1].ceil() as i32).min(imgsz as i32);
+                for xx in x0..x1 {
+                    if xx >= 0 && (xx as u32) < imgsz {
+                        out[(yy as u32 * imgsz + xx as u32) as usize] = (idx + 1) as u8;
+                    }
+                }
+            }
         }
     }
     out

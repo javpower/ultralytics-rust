@@ -8,3 +8,5 @@ __pycache__/
 .env
 scripts/env.local.sh
 target-fresh/
+data/
+runs/

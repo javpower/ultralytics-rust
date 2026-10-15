@@ -5,8 +5,8 @@ pub mod loss;
 pub mod nms;
 
 pub use engine::{
-    load_checkpoint, predict, save_checkpoint, train, validate_model, ModelEma, PredictOut,
-    TrainCfg, TrainReport,
+    load_checkpoint, predict, save_checkpoint, train, validate_model, validate_task, ModelEma,
+    PredictOut, TrainCfg, TrainReport,
 };
 pub use loss::{classification_loss, v8_detection_loss, DetBatch, LossW};
 pub use nms::{non_max_suppression_ex, NmsCfg};

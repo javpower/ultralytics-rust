@@ -1,7 +1,8 @@
 //! 纯 Rust ONNX 导出：按层 DAG 发射 IR 节点 + 权重 initializer。
 //!
-//! v1 范围：v5/v8 卷积全路径 + SPPF/C2f/C3k2/C3/C2fCIB/SCDown + 检测头 + e2e topk；
-//! 含注意力模块（v11/26 的 C2PSA）走静态图需要 pe 的固定 HW，v1 明确报错（roadmap）。
+//! 范围：v5/v8/v9/v10 卷积全路径 + SPPF/C2f/C3k2/C3/C2fCIB/SCDown + 检测头（图内解码）
+//! + PSA 注意力族（Psa/C2PSA/C2fPSA，固定输入尺寸静态图）。
+//! A2C2f（v12 Area-Attention）与 classify/semseg 头显式报错（roadmap）。
 //! 手写 protobuf（wire format）零依赖。
 
 use std::path::Path;
@@ -369,8 +370,8 @@ fn anchor_tables(imgsz: i64, strides: &[f64]) -> (Vec<f32>, Vec<f32>, i64) {
     (anc, st4, a)
 }
 
-/// 图内解码（官方默认导出语义，Detect._inference）：DFL 积分 + dist2bbox(xywh)×strides +
-/// sigmoid 分数，输出 (1, 4+nc, A)。
+/// 图内解码（官方默认导出语义，Detect._inference）：DFL 积分 + dist2bbox×strides +
+/// sigmoid 分数。标准模型输出 (1, 4+nc, A)（xywh）；e2e 输出 (1, 300, 6)（xyxy + topk）。
 fn emit_decode(
     g: &mut G,
     raw: &str,
@@ -378,6 +379,7 @@ fn emit_decode(
     nc: i64,
     imgsz: i64,
     strides: &[f64],
+    e2e: bool,
 ) -> Result<String, UlError> {
     let (anc_data, st_data, a) = anchor_tables(imgsz, strides);
 
@@ -435,41 +437,114 @@ fn emit_decode(
     let wh = g.fresh("dec.wh");
     g.nodes.push(node_proto("Sub", &[&x2y2, &x1y1], &[&wh], &[]));
     let dbox = g.fresh("dec.dbox");
-    g.nodes.push(node_proto("Concat", &[&cxy, &wh], &[&dbox], &[("axis", AttrVal::I(1))]));
+    let dbox = if e2e {
+        // end2end：xyxy（官方 decode_bboxes xywh=not end2end → False）
+        g.concat(&[x1y1, x2y2], "dec")
+    } else {
+        g.concat(&[cxy, wh], "dec")
+    };
     let dbox_px = g.fresh("dec.dbox_px");
     g.nodes.push(node_proto("Mul", &[&dbox, &st], &[&dbox_px], &[]));
 
     let sig = g.fresh("dec.sig");
     g.nodes.push(node_proto("Sigmoid", &[&scores], &[&sig], &[]));
+    if !e2e {
+        let out = g.fresh("output");
+        g.nodes.push(node_proto("Concat", &[&dbox_px, &sig], &[&out], &[("axis", AttrVal::I(1))]));
+        return Ok(out);
+    }
+
+    // ---- e2e topk 后处理（官方 postprocess + get_topk_index，k=max_det=300）----
+    let k = 300i64;
+    let zero_ax = g.fresh("e2e.ax");
+    g.init_i64(&zero_ax, &[1], vec![2]);
+    // scores (1,nc,A) → max over cls → (1,A)
+    let mx = g.fresh("e2e.max");
+    g.nodes
+        .push(node_proto("ReduceMax", &[&sig], &[&mx], &[("axes", AttrVal::Is(vec![1])), ("keepdims", AttrVal::I(0))]));
+    // ori_index = TopK(max, k)
+    let kv = g.fresh("e2e.k");
+    g.init_i64(&kv, &[1], vec![k]);
+    let (_sv, ori) = {
+        let v = g.fresh("e2e.top1_v");
+        let i = g.fresh("e2e.top1_i");
+        g.nodes
+            .push(node_proto("TopK", &[&mx, &kv], &[&v, &i], &[("axis", AttrVal::I(1)), ("largest", AttrVal::I(1)), ("sorted", AttrVal::I(1))]));
+        (v, i)
+    };
+    // scores_sel = sig[:, :, ori] → (1,nc,k) → 转置 (1,k,nc)
+    let ori_f = g.reshape(&ori, &[-1], "e2e.ori_f"); // Gather 索引须一维（2-D 会升秩）
+    let sel = g.fresh("e2e.sel");
+    g.nodes.push(node_proto("Gather", &[&sig, &ori_f], &[&sel], &[("axis", AttrVal::I(2))]));
+    let sel_t = g.fresh("e2e.sel_t");
+    g.nodes
+        .push(node_proto("Transpose", &[&sel], &[&sel_t], &[("perm", AttrVal::Is(vec![0, 2, 1]))]));
+    let flat = g.reshape(&sel_t, &[1, k * nc], "e2e.flat");
+    let (s2, idx) = {
+        let v = g.fresh("e2e.top2_v");
+        let i = g.fresh("e2e.top2_i");
+        g.nodes
+            .push(node_proto("TopK", &[&flat, &kv], &[&v, &i], &[("axis", AttrVal::I(1)), ("largest", AttrVal::I(1)), ("sorted", AttrVal::I(1))]));
+        (v, i)
+    };
+    // cls_idx = idx % nc；box_row = idx / nc
+    let ncc = g.fresh("e2e.nc");
+    g.init_i64(&ncc, &[1], vec![nc]);
+    let cls_i = g.fresh("e2e.cls_i");
+    g.nodes.push(node_proto("Mod", &[&idx, &ncc], &[&cls_i], &[("fmod", AttrVal::I(0))]));
+    let row = g.fresh("e2e.row");
+    g.nodes.push(node_proto("Div", &[&idx, &ncc], &[&row], &[]));
+    // ori 行选择 → (1,k)
+    let row_f = g.reshape(&row, &[-1], "e2e.row_f");
+    let ori_k = g.fresh("e2e.ori_k");
+    g.nodes.push(node_proto("Gather", &[&ori, &row_f], &[&ori_k], &[("axis", AttrVal::I(1))]));
+    // boxes (1,4,A) gather ori_k → (1,4,k) → 转置 (1,k,4)
+    let ori_kf = g.reshape(&ori_k, &[-1], "e2e.ori_kf");
+    let bg = g.fresh("e2e.bg");
+    g.nodes.push(node_proto("Gather", &[&dbox_px, &ori_kf], &[&bg], &[("axis", AttrVal::I(2))]));
+    let bt = g.fresh("e2e.bt");
+    g.nodes
+        .push(node_proto("Transpose", &[&bg], &[&bt], &[("perm", AttrVal::Is(vec![0, 2, 1]))]));
+    let s2u = g.fresh("e2e.s2u");
+    g.nodes
+        .push(node_proto("Unsqueeze", &[&s2, &zero_ax], &[&s2u], &[]));
+    let clu = g.fresh("e2e.clu");
+    g.nodes.push(node_proto("Unsqueeze", &[&cls_i, &zero_ax], &[&clu], &[]));
+    let cl_f = g.fresh("e2e.cl_f");
+    g.nodes.push(node_proto("Cast", &[&clu], &[&cl_f], &[("to", AttrVal::I(1))]));
     let out = g.fresh("output");
-    g.nodes.push(node_proto("Concat", &[&dbox_px, &sig], &[&out], &[("axis", AttrVal::I(1))]));
+    g.nodes.push(node_proto("Concat", &[&bt, &s2u, &cl_f], &[&out], &[("axis", AttrVal::I(2))]));
     Ok(out)
 }
 
 /// 导出入口。输出为官方默认导出语义的解码结果 (1, 4+nc, A)：xywh 像素 + sigmoid 分数。
 pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std::path::PathBuf, UlError> {
-    if model.end2end {
-        return bail(
-            "onnx export: end2end（v10/yolo26）的图内 topk 后处理在 roadmap；请用 format=safetensors",
-        );
-    }
     let mut g = G { nodes: vec![], inits: vec![], tmp: 0 };
     let input_name = "images".to_string();
     let mut cur = input_name.clone();
 
+    // 每层输出空间尺寸（PSA 的 reshape 需要具体 H/W）
+    let mut hws: Vec<(i64, i64)> = vec![(imgsz as i64, imgsz as i64); model.layers.len()];
     let mut y: Vec<Option<String>> = vec![None; model.layers.len()];
+    let mut cur_hw = (imgsz as i64, imgsz as i64);
     for (li, layer) in model.layers.iter().enumerate() {
         let mut inputs: Vec<String> = Vec::new();
+        let mut in_hw = cur_hw;
         for f in &layer.from {
             if *f == -1 {
                 inputs.push(cur.clone());
+                in_hw = cur_hw;
             } else {
                 let idx = if *f < 0 { (li as i64 + f) as usize } else { *f as usize };
                 inputs.push(y[idx].clone().ok_or_else(|| UlError::Msg(format!("onnx: layer {li} input {f} unavailable")))?);
+                in_hw = hws[idx];
             }
         }
         let prefix = format!("model.{li}");
-        let out = emit_layer(&mut g, layer, &inputs, &prefix)?;
+        let out = emit_layer(&mut g, layer, &inputs, &prefix, in_hw)?;
+        let ohw = module_hw(&layer.module, in_hw);
+        hws[li] = ohw;
+        cur_hw = ohw;
         if model.save.contains(&li) {
             y[li] = Some(out.clone());
         }
@@ -482,7 +557,7 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
         Module::Head(crate::parse::HeadMod::Detect(_))
     );
     let out_name = if last_is_detect {
-        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride)?
+        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride, model.end2end)?
     } else {
         cur.clone()
     };
@@ -497,11 +572,15 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
         bytes_field(&mut graph, 5, init);
     }
     // GraphProto.input(11) / output(12) 在 graph 内部
-    let out_ch = 4 + model.nc;
     let a = model.stride.iter().map(|s| (imgsz as f64 / s).powi(2) as i64).sum::<i64>();
+    let out_dims: Vec<i64> = if model.end2end {
+        vec![1, 300, 6]
+    } else {
+        vec![1, 4 + model.nc, a]
+    };
     bytes_field(&mut graph, 11, &value_info(&input_name, &[1, 3, imgsz as i64, imgsz as i64]));
-    bytes_field(&mut graph, 12, &value_info(&out_name, &[1, out_ch, a]));
-    let mp = model_proto(&graph, &input_name, &out_name, &[1, out_ch, a]);
+    bytes_field(&mut graph, 12, &value_info(&out_name, &out_dims));
+    let mp = model_proto(&graph, &input_name, &out_name, &out_dims);
     std::fs::create_dir_all(out_dir)?;
     let stem = Path::new(&model.yaml_file)
         .file_stem()
@@ -512,8 +591,9 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
     Ok(name)
 }
 
-fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str) -> Result<String, UlError> {
+fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str, hw: (i64, i64)) -> Result<String, UlError> {
     let x = &inputs[0];
+    let _ = hw;
     let out = match &layer.module {
         Module::Conv(c) => g.conv_silu(p, x, c),
         Module::DwConv(c) => g.conv_silu(p, x, c),
@@ -532,9 +612,9 @@ fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str) -> Result<St
             let cat = g.concat(&[cv1, m1, m2, m3], p);
             g.conv_silu(&format!("{p}.cv2"), &cat, &sp.cv2)
         }
-        Module::C2f(c) => return emit_c2f(g, &c.cv1, &c.cv2, &c.m, x, p),
-        Module::C3k2(k) => return emit_c2f(g, &k.base.cv1, &k.base.cv2, &k.base.m, x, p),
-        Module::C2fCib(k) => return emit_c2f(g, &k.base.cv1, &k.base.cv2, &k.base.m, x, p),
+        Module::C2f(c) => return emit_c2f(g, &c.cv1, &c.cv2, &c.m, x, p, hw),
+        Module::C3k2(k) => return emit_c2f(g, &k.base.cv1, &k.base.cv2, &k.base.m, x, p, hw),
+        Module::C2fCib(k) => return emit_c2f(g, &k.base.cv1, &k.base.cv2, &k.base.m, x, p, hw),
         Module::C3(c3) => {
             let a = g.conv_silu(&format!("{p}.cv1"), x, &c3.cv1);
             let b = g.conv_silu(&format!("{p}.cv2"), x, &c3.cv2);
@@ -545,6 +625,9 @@ fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str) -> Result<St
             let cat = g.concat(&[cur, b], p);
             g.conv_silu(&format!("{p}.cv3"), &cat, &c3.cv3)
         }
+        Module::Psa(m) => emit_psa(g, m, x, hw, p),
+        Module::C2Psa(m) => emit_c2psa(g, m, x, hw, p),
+        Module::C2fPsa(m) => return emit_c2f(g, &m.base.cv1, &m.base.cv2, &m.base.m, x, p, hw),
         Module::Concat(_) => g.concat(inputs, p),
         Module::Upsample(s) => g.upsample(x, *s, p),
         Module::Identity => x.clone(),
@@ -576,7 +659,36 @@ fn var_name(m: &Module) -> &Module {
     m
 }
 
-fn emit_c2f(g: &mut G, cv1: &Conv, cv2: &Conv, m: &[InnerBlock], x: &str, p: &str) -> Result<String, UlError> {
+/// 估算模块输出空间尺寸（静态图尺寸跟踪用）。
+fn module_hw(m: &Module, (h, w): (i64, i64)) -> (i64, i64) {
+    let conv = |x: i64, k: i64, st: i64, pd: i64| (x + 2 * pd - k) / st + 1;
+    match m {
+        Module::Conv(c) | Module::DwConv(c) => {
+            let k = c.conv.weight.size()[2];
+            (conv(h, k, c.conv.stride, c.conv.pad_h), conv(w, k, c.conv.stride, c.conv.pad_w))
+        }
+        Module::ScDown(sd) => {
+            let k = sd.cv2.conv.weight.size()[2];
+            (conv(h, k, sd.cv2.conv.stride, sd.cv2.conv.pad_h), conv(w, k, sd.cv2.conv.stride, sd.cv2.conv.pad_w))
+        }
+        Module::Upsample(s) => (h * *s as i64, w * *s as i64),
+        Module::MaxPool2d(k, st, pd) => {
+            let pd = if *pd < 0 { k / 2 } else { *pd };
+            (conv(h, *k, *st, pd), conv(w, *k, *st, pd))
+        }
+        _ => (h, w),
+    }
+}
+
+fn emit_c2f(
+    g: &mut G,
+    cv1: &Conv,
+    cv2: &Conv,
+    m: &[InnerBlock],
+    x: &str,
+    p: &str,
+    hw: (i64, i64),
+) -> Result<String, UlError> {
     let c1 = g.conv_silu(&format!("{p}.cv1"), x, cv1);
     let hidden = cv1.conv.weight.size()[0] / 2;
     let (a, b) = g.chunk2(&c1, hidden, p);
@@ -595,8 +707,10 @@ fn emit_c2f(g: &mut G, cv1: &Conv, cv2: &Conv, m: &[InnerBlock], x: &str, p: &st
                 let cat = g.concat(&[cur, b], &format!("{p}.m.{i}"));
                 g.conv_silu(&format!("{p}.m.{i}.cv3"), &cat, &k.inner.cv3)
             }
-            InnerBlock::BottleneckPsa(_, _) | InnerBlock::Psa(_) => {
-                return bail("onnx export: PSA 注意力模块 on roadmap（v11/26 用 safetensors 导出）")
+            InnerBlock::Psa(psb) => emit_psa_block(g, psb, &last, hw, p),
+            InnerBlock::BottleneckPsa(b, psb) => {
+                let bo = emit_bottleneck(g, &format!("{p}.m.{i}.0"), &last, b);
+                emit_psa_block(g, psb, &bo, hw, &format!("{p}.m.{i}.1"))
             }
             InnerBlock::Cib(cib) => {
                 let mut cur = last.clone();
@@ -623,6 +737,96 @@ fn emit_c2f(g: &mut G, cv1: &Conv, cv2: &Conv, m: &[InnerBlock], x: &str, p: &st
     Ok(g.conv_silu(&format!("{p}.cv2"), &cat, cv2))
 }
 
+/// Attention 发射：qkv → 按头 reshape → split q/k/v → softmax(q^T k)·scale → v@attn^T
+/// → reshape + DW pe → proj。固定 HW 静态图。
+fn emit_attention(
+    g: &mut G,
+    attn: &crate::attention::Attention,
+    x: &str,
+    hw: (i64, i64),
+    p: &str,
+) -> String {
+    let (h, w) = hw;
+    let n = h * w;
+    let nh = attn.num_heads;
+    let kd = attn.key_dim;
+    let hd = attn.head_dim;
+    let qkv = g.conv_bn(&format!("{p}.qkv"), x, &attn.qkv);
+    let r = g.reshape(&qkv, &[1, nh, kd * 2 + hd, n], &format!("{p}.qkv.v"));
+    let sp = g.fresh(&format!("{p}.sp"));
+    g.init_i64(&sp, &[3], vec![kd, kd, hd]);
+    let q = g.fresh(&format!("{p}.q"));
+    let k = g.fresh(&format!("{p}.k"));
+    let v = g.fresh(&format!("{p}.v"));
+    g.nodes
+        .push(node_proto("Split", &[&r, &sp], &[&q, &k, &v], &[("axis", AttrVal::I(2))]));
+    // attn = softmax((q·scale)^T @ k)
+    let sc = g.fresh(&format!("{p}.scale"));
+    g.init_f32_data(&sc, &[], vec![(kd as f64).powf(-0.5) as f32]);
+    let qs = g.fresh(&format!("{p}.qs"));
+    g.nodes.push(node_proto("Mul", &[&q, &sc], &[&qs], &[]));
+    let qt = g.fresh(&format!("{p}.qt"));
+    g.nodes
+        .push(node_proto("Transpose", &[&qs], &[&qt], &[("perm", AttrVal::Is(vec![0, 1, 3, 2]))]));
+    let am = g.fresh(&format!("{p}.mm"));
+    g.nodes.push(node_proto("MatMul", &[&qt, &k], &[&am], &[]));
+    let sm = g.fresh(&format!("{p}.sm"));
+    g.nodes
+        .push(node_proto("Softmax", &[&am], &[&sm], &[("axis", AttrVal::I(-1))]));
+    let smt = g.fresh(&format!("{p}.smt"));
+    g.nodes
+        .push(node_proto("Transpose", &[&sm], &[&smt], &[("perm", AttrVal::Is(vec![0, 1, 3, 2]))]));
+    let y = g.fresh(&format!("{p}.y"));
+    g.nodes.push(node_proto("MatMul", &[&v, &smt], &[&y], &[]));
+    let ch = nh * hd;
+    let yim = g.reshape(&y, &[1, ch, h, w], &format!("{p}.yim"));
+    let vim = g.reshape(&v, &[1, ch, h, w], &format!("{p}.vim"));
+    let pe = g.conv_bn(&format!("{p}.pe"), &vim, &attn.pe);
+    let add = g.add(&yim, &pe, p);
+    g.conv_bn(&format!("{p}.proj"), &add, &attn.proj)
+}
+
+/// PSABlock：x + attn(x) → +ffn。
+fn emit_psa_block(
+    g: &mut G,
+    psb: &crate::attention::PsaBlock,
+    x: &str,
+    hw: (i64, i64),
+    p: &str,
+) -> String {
+    let a = emit_attention(g, &psb.attn, x, hw, &format!("{p}.attn"));
+    let x1 = g.add(x, &a, &format!("{p}.a"));
+    let f0 = g.conv_silu(&format!("{p}.ffn.0"), &x1, &psb.ffn.0);
+    let f1 = g.conv_bn(&format!("{p}.ffn.1"), &f0, &psb.ffn.1);
+    g.add(&x1, &f1, &format!("{p}.f"))
+}
+
+/// PSA：cv1 → 半通道过 attn+ffn → cat → cv2。
+fn emit_psa(g: &mut G, m: &crate::attention::Psa, x: &str, hw: (i64, i64), p: &str) -> String {
+    let c = m.c;
+    let cv1 = g.conv_silu(&format!("{p}.cv1"), x, &m.cv1);
+    let (x1, x2) = g.split2(&cv1, [c, c], 1, &format!("{p}.sp"));
+    let a = emit_attention(g, &m.attn, &x2, hw, &format!("{p}.attn"));
+    let b = g.add(&x2, &a, &format!("{p}.b"));
+    let f0 = g.conv_silu(&format!("{p}.ffn.0"), &b, &m.ffn.0);
+    let f1 = g.conv_bn(&format!("{p}.ffn.1"), &f0, &m.ffn.1);
+    let bo = g.add(&b, &f1, &format!("{p}.bo"));
+    let cat = g.concat(&[x1, bo], p);
+    g.conv_silu(&format!("{p}.cv2"), &cat, &m.cv2)
+}
+
+/// C2PSA：cv1 → 半通道过 n 个 PSABlock → cat → cv2。
+fn emit_c2psa(g: &mut G, m: &crate::attention::C2Psa, x: &str, hw: (i64, i64), p: &str) -> String {
+    let c = m.c;
+    let cv1 = g.conv_silu(&format!("{p}.cv1"), x, &m.cv1);
+    let (x1, mut b) = g.split2(&cv1, [c, c], 1, &format!("{p}.sp"));
+    for (i, blk) in m.m.iter().enumerate() {
+        b = emit_psa_block(g, blk, &b, hw, &format!("{p}.m.{i}"));
+    }
+    let cat = g.concat(&[x1, b], p);
+    g.conv_silu(&format!("{p}.cv2"), &cat, &m.cv2)
+}
+
 fn emit_bottleneck(g: &mut G, p: &str, x: &str, bn: &Bottleneck) -> String {
     let a = g.conv_silu(&format!("{p}.cv1"), x, &bn.cv1);
     let b = g.conv_silu(&format!("{p}.cv2"), &a, &bn.cv2);
@@ -633,8 +837,17 @@ fn emit_bottleneck(g: &mut G, p: &str, x: &str, bn: &Bottleneck) -> String {
     }
 }
 
-/// 检测头：cv2/cv3 → cat → (1, 4+nc, A)。
+/// 检测头：cv2/cv3 → cat → (1, 4+nc, A)。e2e 模型发射 one2one 分支（官方导出语义）。
 fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], p: &str) -> Result<String, UlError> {
+    let empty: Vec<crate::head::Branch> = Vec::new();
+    let (cv2r, cv3r) = if dh.end2end {
+        (dh.o2o_cv2.as_ref().unwrap_or(&dh.cv2), dh.o2o_cv3.as_ref().unwrap_or(&dh.cv3))
+    } else {
+        (&dh.cv2, &dh.cv3)
+    };
+    let _ = empty;
+    let cv2r: &[crate::head::Branch] = cv2r;
+    let cv3r: &[crate::head::Branch] = cv3r;
     let emit_branch = |g: &mut G, name: &str, branches: &[crate::head::Branch], out_ch: i64| -> String {
         let mut parts = Vec::new();
         for (i, br) in branches.iter().enumerate() {
@@ -667,8 +880,8 @@ fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], 
         y
     };
 
-    let boxes = emit_branch(g, "cv2", &dh.cv2, dh.reg_max * 4);
-    let scores = emit_branch(g, "cv3", &dh.cv3, dh.nc);
+    let boxes = emit_branch(g, "cv2", cv2r, dh.reg_max * 4);
+    let scores = emit_branch(g, "cv3", cv3r, dh.nc);
     Ok(g.concat(&[boxes, scores], p))
 }
 

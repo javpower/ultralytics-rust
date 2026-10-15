@@ -41,6 +41,9 @@ pub struct RawOut {
 
 impl RawOut {
     fn init(p: &VarPath, c_in: i64, c_out: i64) -> Self {
+        if c_out <= 0 || c_in <= 0 {
+            panic!("RawOut::init 非法通道 c_in={c_in} c_out={c_out} at {}", p.full_name("weight"));
+        }
         let bound = (1.0 / (c_in * 1 * 1) as f64).sqrt();
         RawOut {
             weight: p.var_conv_weight("weight", c_out, c_in, 1, bound),
@@ -403,6 +406,20 @@ impl DetectHead {
         );
         let mut extra = None;
         let mut extra2 = None;
+        let mut proto: Option<Tensor> = None;
+        let mut proto_sem: Option<Tensor> = None;
+        // Segment/Segment26：proto 由头的输入特征生成（官方 self.proto(x[0])）
+        match &self.proto {
+            Some(ProtoVariant::P1(p)) => proto = Some(p.forward(&x[0], train)),
+            Some(ProtoVariant::P26(p)) => {
+                let (pb, sem) = p.forward(x, train);
+                proto = Some(pb);
+                if train {
+                    proto_sem = sem;
+                }
+            }
+            None => {}
+        }
         match self.kind {
             ExtraKind::None => {}
             ExtraKind::Mask => {
@@ -460,7 +477,7 @@ impl DetectHead {
                 });
             }
         }
-        RawPreds { boxes, scores, extra, extra2, proto: None, proto_sem: None, feats: x.iter().map(|t| t.shallow_clone()).collect() }
+        RawPreds { boxes, scores, extra, extra2, proto, proto_sem, feats: x.iter().map(|t| t.shallow_clone()).collect() }
     }
 
     fn nk(&self) -> i64 {

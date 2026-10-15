@@ -581,6 +581,8 @@ pub fn parse_model(
             }
             "Detect" | "Segment" | "Segment26" | "Pose" | "Pose26" | "OBB" | "OBB26" | "v10Detect" => {
                 let chs: Vec<i64> = f.iter().map(|fi| ch_f(*fi)).collect::<Result<Vec<_>, _>>()?;
+                // v10Detect 模块名即 e2end 语义（官方 parse: end2end = d.end2end or m == "v10Detect"）
+                let end2end = end2end || m == "v10Detect";
                 let (kind, nm, npr, ne) = match m {
                     "Detect" | "v10Detect" => (ExtraKind::None, 0, 0, 0),
                     "Segment" | "Segment26" => {

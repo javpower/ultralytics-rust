@@ -185,6 +185,98 @@ pub fn xywh2xyxy(x: &Tensor) -> Tensor {
     Tensor::cat(&[xy - wh / 2.0, xy + wh / 2.0], -1)
 }
 
+// ---------------- 旋转框（OBB） ----------------
+
+/// `rbox2dist`：目标 xywhr（格单位）+ 角度 → ltrb 距离（clamp 到 [0, reg_max−0.01]）。
+/// 官方语义：offset 按 cos/sin 旋转到主轴，dist = [w/2−xf, h/2−yf, w/2+xf, h/2+yf]。
+pub fn rbox2dist(target_xywh: &Tensor, anchor_points: &Tensor, target_angle: &Tensor, reg_max: i64) -> Tensor {
+    // target_xywh (N, 4) xywh；anchor (2, A) → (N, 2)；angle (N, 1)
+    let dim = 1;
+    let xy = target_xywh.narrow(dim, 0, 2);
+    let wh = target_xywh.narrow(dim, 2, 2);
+    let offset = xy - anchor_points.transpose(0, 1); // (N, 2)
+    let off_x = offset.narrow(1, 0, 1);
+    let off_y = offset.narrow(1, 1, 1);
+    let cos = target_angle.cos();
+    let sin = target_angle.sin();
+    let xf = &off_x * &cos + &off_y * &sin;
+    let yf = -&off_x * &sin + &off_y * &cos;
+    let w = wh.narrow(1, 0, 1);
+    let h = wh.narrow(1, 1, 1);
+    let dist = Tensor::cat(&[&w / 2.0 - &xf, &h / 2.0 - &yf, &w / 2.0 + &xf, &h / 2.0 + &yf], dim);
+    dist.clamp(0.0, (reg_max - 1) as f64 - 0.01)
+}
+
+/// 协方差矩阵分量 (a, b, c)：gbbs = [w²/12+floor, h²/12+floor, r]。
+fn cov_components(whr: &Tensor, floor: f64) -> (Tensor, Tensor, Tensor) {
+    let w2 = whr.narrow(1, 2, 1).pow_tensor_scalar(2.0) / 12.0 + floor;
+    let h2 = whr.narrow(1, 3, 1).pow_tensor_scalar(2.0) / 12.0 + floor;
+    let r = whr.narrow(1, 4, 1);
+    let cos = r.cos();
+    let sin = r.sin();
+    let cos2 = cos.pow_tensor_scalar(2.0);
+    let sin2 = sin.pow_tensor_scalar(2.0);
+    (&w2 * &cos2 + &h2 * &sin2, &w2 * &sin2 + &h2 * &cos2, (&w2 - &h2) * cos * sin)
+}
+
+/// `probiou` 成对版：(N,5) vs (N,5) → (N,1)。CIoU=true 时含 wh 纵横比罚项。
+pub fn probiou_pairwise(obb1: &Tensor, obb2: &Tensor, ciou: bool, floor: f64) -> Tensor {
+    let (a1, b1, c1) = cov_components(obb1, floor);
+    let (a2, b2, c2) = cov_components(obb2, floor);
+    let x1: Tensor = obb1.narrow(1, 0, 1);
+    let y1: Tensor = obb1.narrow(1, 1, 1);
+    let x2: Tensor = obb2.narrow(1, 0, 1);
+    let y2: Tensor = obb2.narrow(1, 1, 1);
+    let eps = 1e-7f64;
+    let sa: Tensor = &a1 + &a2;
+    let sb: Tensor = &b1 + &b2;
+    let sc: Tensor = &c1 + &c2;
+    let denom: Tensor = &sa * &sb - sc.pow_tensor_scalar(2.0) + eps;
+    let dy: Tensor = &y1 - &y2;
+    let dx: Tensor = &x1 - &x2;
+    let t1: Tensor = ((&sa * dy.pow_tensor_scalar(2.0) + &sb * dx.pow_tensor_scalar(2.0)) / &denom) * 0.25;
+    let t2: Tensor = (&sc * &x2 * &dy / &denom) * 0.5;
+    let inner: Tensor = ((&a1 * &b1 - c1.pow_tensor_scalar(2.0)).clamp_min(0.0)
+        * (&a2 * &b2 - c2.pow_tensor_scalar(2.0)).clamp_min(0.0))
+    .sqrt();
+    let t3: Tensor = ((sa * sb - sc.pow_tensor_scalar(2.0)) / (inner * 4.0 + eps) + eps).log() * 0.5;
+    let bd: Tensor = (t1 + t2 + t3).clamp(eps, 100.0);
+    let hd: Tensor = ((-bd).exp() * -1.0 + 1.0 + eps).sqrt();
+    let mut iou: Tensor = 1.0 - &hd;
+    if ciou {
+        let w1: Tensor = obb1.narrow(1, 2, 1);
+        let h1: Tensor = obb1.narrow(1, 3, 1);
+        let w2: Tensor = obb2.narrow(1, 2, 1);
+        let h2: Tensor = obb2.narrow(1, 3, 1);
+        let v: Tensor = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0)
+            * (4.0 / std::f64::consts::PI.powi(2));
+        let base: Tensor = v.pow_tensor_scalar(1.0) - &iou + (1.0 + eps);
+        let alpha: Tensor = &v / &base;
+        iou = &iou - &v * &alpha;
+    }
+    iou // 已是 (N,1)
+}
+
+/// xywhr（像素）→ 四角点 (N, 8)（x1y1x2y2x3y3x4y4，绕行顺序 p0..p3）。
+pub fn xywhr2corners(whr: &Tensor) -> Tensor {
+    let (xc, yc) = (whr.narrow(1, 0, 1), whr.narrow(1, 1, 1));
+    let cos = whr.narrow(1, 4, 1).cos();
+    let sin = whr.narrow(1, 4, 1).sin();
+    let (w, h) = (whr.narrow(1, 2, 1), whr.narrow(1, 3, 1));
+    // 轴向量：u = w·(cos, sin)，v = h·(−sin, cos)
+    let (ux, uy) = (&w * &cos, &w * &sin);
+    let (vx, vy) = (-&h * &sin, &h * &cos);
+    Tensor::cat(
+        &[
+            &xc - &ux - &vx, &yc - &uy - &vy, // p0
+            &xc + &ux - &vx, &yc + &uy - &vy, // p1
+            &xc + &ux + &vx, &yc + &uy + &vy, // p2
+            &xc - &ux + &vx, &yc - &uy + &vy, // p3
+        ],
+        1,
+    )
+}
+
 /// `clip_boxes`：裁剪到图像边界（boxes (N,4) xyxy，最后一维）。
 pub fn clip_boxes(boxes: &Tensor, height: f64, width: f64) -> Tensor {
     let s = boxes.split_with_sizes(&[1, 1, 1, 1], -1);

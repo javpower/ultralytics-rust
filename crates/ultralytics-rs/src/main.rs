@@ -35,7 +35,10 @@ fn find_cfg_path(name: &str) -> PathBuf {
     if p.exists() {
         return p.to_path_buf();
     }
-    let stem = Path::new(name).file_name().and_then(|s| s.to_str()).unwrap_or(name);
+    let mut stem = Path::new(name).file_name().and_then(|s| s.to_str()).unwrap_or(name);
+    if stem.ends_with(".pt") {
+        stem = &stem[..stem.len() - 3];
+    }
     for dir in ["", "datasets/", "v8/", "11/", "12/", "26/", "v10/", "v9/", "v6/", "v5/", "v3/"] {
         let key = if dir.is_empty() { format!("models/{stem}") } else { format!("models/{dir}{stem}") };
         for cand in [key.clone(), format!("{key}.yaml")] {
@@ -46,7 +49,8 @@ fn find_cfg_path(name: &str) -> PathBuf {
             }
         }
     }
-    p.to_path_buf()
+    // 注册表未命中：回传剥掉 .pt 的惯用名（load_model_yaml 可做 scale 推断）
+    PathBuf::from(stem)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -110,6 +114,8 @@ fn main() -> anyhow::Result<()> {
                 seed: geti("seed", 0) as u64,
                 workers: geti("workers", 8) as usize,
                 augment,
+                nbs: geti("nbs", 16) as usize,
+                multi_scale: getb("multi_scale", false),
                 val_interval: 1,
                 project: PathBuf::from(get("project").unwrap_or_else(|| "runs".into())),
                 name: get("name").unwrap_or_else(|| "train".into()),
@@ -198,7 +204,7 @@ fn main() -> anyhow::Result<()> {
             let val_dir = val_dirs.first().ok_or_else(|| anyhow::anyhow!("no val split"))?;
             let ds = ul_data::dataset::YoloDataset::from_img_dir(val_dir, names, kpt_dim)?;
             let (model, _, _) = load_model_for_infer(&model_name, device)?;
-            let metrics = validate_model(&model, &ds, geti("imgsz", 640) as u32, device, &model.names)?;
+            let metrics = ul_engine::validate_task(&model, &ds, geti("imgsz", 640) as u32, device, &model.names)?;
             println!(
                 "val: P={:.4} R={:.4} mAP50={:.4} mAP50-95={:.4}",
                 metrics.mp, metrics.mr, metrics.map50, metrics.map50_95
@@ -258,7 +264,14 @@ fn load_model_for_infer(model_name: &str, device: tch::Device) -> anyhow::Result
         let names = m.names.clone();
         return Ok((m, nc, names));
     }
-    let m = load_checkpoint(Path::new(model_name), device)?;
+    // 训练产物目录优先；否则按嵌入 yaml 构建（随机权重，用于导出/烟测）
+    if let Ok(m) = load_checkpoint(Path::new(model_name), device) {
+        let nc = m.nc;
+        let names = m.names.clone();
+        return Ok((m, nc, names));
+    }
+    let cfg_path = find_cfg_path(model_name);
+    let m = YoloModel::build(&cfg_path.to_string_lossy(), None, device, false)?;
     let nc = m.nc;
     let names = m.names.clone();
     Ok((m, nc, names))

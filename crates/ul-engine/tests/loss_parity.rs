@@ -55,7 +55,7 @@ fn loss_components_match_official() {
     let mut m = YoloModel::build("yolov8n", None, Device::Cpu, false).unwrap();
     ul_nn::pt::load_state_dict_into(&m.vs, &sd, false).unwrap();
 
-    let batch = DetBatch { img, labels, batch_size: b, imgsz: s };
+    let batch = DetBatch::detect(img, labels, b, s);
     let out = m.forward(&batch.img, true).unwrap();
     let head = match out {
         ModelOutput::Detect(h) => h,
