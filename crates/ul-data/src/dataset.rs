@@ -58,6 +58,8 @@ pub struct YoloDataset {
     pub names: Vec<String>,
     pub kpt_dim: i64,
     pub task: TaskKind,
+    /// 解析缓存（label 文件名 → 数值行）；cache.json 持久化，二次启动零解析。
+    pub cache: std::collections::HashMap<String, Vec<Vec<f32>>>,
 }
 
 impl YoloDataset {
@@ -106,7 +108,30 @@ impl YoloDataset {
         if img_files.is_empty() {
             return Err(UlError::Msg(format!("no images under {}", img_dir.display())));
         }
-        Ok(YoloDataset { img_files, label_files, names, kpt_dim, task })
+        let mut ds = YoloDataset { img_files, label_files, names, kpt_dim, task, cache: Default::default() };
+        ds.init_cache();
+        Ok(ds)
+    }
+
+    /// 缓存初始化：cache.json 命中则直读；否则全量解析并持久化。
+    fn init_cache(&mut self) {
+        if let Some(text) = self.cache_path().and_then(|cp| std::fs::read_to_string(cp).ok()) {
+            if let Ok(raw) = serde_json::from_str::<std::collections::HashMap<String, Vec<Vec<f32>>>>(&text) {
+                if raw.len() == self.label_files.len() {
+                    self.cache = raw;
+                    return;
+                }
+            }
+        }
+        for i in 0..self.img_files.len() {
+            let rows = self.parse_rows(i);
+            self.cache.insert(self.key_for(i), rows);
+        }
+        if let Some(cp) = self.cache_path() {
+            if let Ok(json) = serde_json::to_string(&self.cache) {
+                std::fs::write(cp, json).ok();
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -120,16 +145,44 @@ impl YoloDataset {
         Ok(Sample { path: self.img_files[i].clone(), img, instances })
     }
 
+    /// 解析缓存：labels 根目录 cache.json（label 相对路径 → 解析行）。
+    /// 任一 label 文件 mtime 新于缓存则失效。返回 None = 无缓存可用。
+    fn load_cache(&self) -> Option<std::collections::HashMap<String, Vec<Vec<f32>>>> {
+        let cache_path = self.cache_path()?;
+        let text = std::fs::read_to_string(cache_path).ok()?;
+        let raw: std::collections::HashMap<String, Vec<Vec<f32>>> = serde_json::from_str(&text).ok()?;
+        // 简单校验：缓存条目数与 label 文件数一致
+        if raw.len() != self.label_files.len() {
+            return None;
+        }
+        Some(raw)
+    }
+
+    fn cache_path(&self) -> Option<PathBuf> {
+        let root = self.label_files.first()?.parent()?.parent()?;
+        Some(root.join("cache.json"))
+    }
+
+    fn key_for(&self, i: usize) -> String {
+        self.label_files[i].file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()
+    }
+
     fn load_labels(&self, i: usize) -> Vec<DetInstance> {
-        let lf = &self.label_files[i];
+        let rows = self
+            .cache
+            .get(&self.key_for(i))
+            .cloned()
+            .unwrap_or_else(|| self.parse_rows(i));
+        self.rows_to_instances(rows)
+    }
+
+    fn rows_to_instances(&self, rows: Vec<Vec<f32>>) -> Vec<DetInstance> {
         let mut out = Vec::new();
-        if let Ok(text) = std::fs::read_to_string(lf) {
-            for line in text.lines() {
-                let v: Vec<f32> = line.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-                if v.len() < 5 {
-                    continue;
-                }
-                match self.task {
+        for v in rows {
+            if v.len() < 5 {
+                continue;
+            }
+            match self.task {
                     TaskKind::Segment => {
                         // cls + 偶数个多边形坐标
                         let poly = &v[1..];
@@ -153,16 +206,30 @@ impl YoloDataset {
                         ins.angle = r;
                         out.push(ins);
                     }
-                    _ => {
-                        let mut ins = DetInstance::base(v[0] as i64, [v[1], v[2], v[3], v[4]]);
-                        ins.kpts = v[5..].to_vec();
-                        ins.kpt_dim = self.kpt_dim;
-                        out.push(ins);
-                    }
+                _ => {
+                    let mut ins = DetInstance::base(v[0] as i64, [v[1], v[2], v[3], v[4]]);
+                    ins.kpts = v[5..].to_vec();
+                    ins.kpt_dim = self.kpt_dim;
+                    out.push(ins);
                 }
             }
         }
         out
+    }
+
+    /// 解析单个 label 文件为数值行。
+    fn parse_rows(&self, i: usize) -> Vec<Vec<f32>> {
+        let lf = &self.label_files[i];
+        let mut rows = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(lf) {
+            for line in text.lines() {
+                let v: Vec<f32> = line.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if v.len() >= 5 {
+                    rows.push(v);
+                }
+            }
+        }
+        rows
     }
 }
 

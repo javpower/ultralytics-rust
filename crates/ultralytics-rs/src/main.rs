@@ -97,6 +97,9 @@ fn main() -> anyhow::Result<()> {
             augment.bgr = getf("bgr", augment.bgr);
             augment.mosaic = getf("mosaic", augment.mosaic);
             augment.mixup = getf("mixup", augment.mixup);
+            augment.copy_paste = getf("copy_paste", augment.copy_paste);
+            augment.cutmix = getf("cutmix", augment.cutmix);
+            augment.erasing = getf("erasing", augment.erasing);
             augment.close_mosaic = geti("close_mosaic", augment.close_mosaic as i64) as usize;
             let cfg = TrainCfg {
                 epochs: geti("epochs", 100) as usize,

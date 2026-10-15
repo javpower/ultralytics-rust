@@ -455,6 +455,15 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             let mut masks_v: Vec<Vec<u8>> = Vec::new();
             for (bi, &idx) in chunk.iter().enumerate() {
                 let mut smp = augmentor.train_augment(idx, &load);
+                // 官方 erasing 仅 classify 管线（default 0.4）
+                if model.task == Task::Classify {
+                    let (a, b, c, d) = {
+                        use rand::Rng as _;
+                        let (a, b, c, d) = rng.gen::<(f32, f32, f32, f32)>();
+                        (a, b, c, d)
+                    };
+                    ul_data::augment::random_erasing(&mut smp, cfg.augment.erasing, a, b, c, d);
+                }
                 if smp.img.w != bsz || smp.img.h != bsz {
                     smp.img = letterbox(&smp.img, bsz, [114, 114, 114]);
                 }
@@ -831,7 +840,9 @@ pub fn predict(
     let mut out = Vec::new();
     for src in sources {
         let img = Img::open(src)?;
-        let lb = letterbox(&img, imgsz, [114, 114, 114]);
+        // rect：按长宽比 32 对齐矩形 letterbox
+        let (rw, rh) = crate::nms::rect_letterbox_size(img.w, img.h, imgsz, 32);
+        let lb = ul_data::augment::letterbox_rect(&img, rw, rh, [114, 114, 114]);
         let x = to_tensor(&[lb], device);
         let o = model.forward(&x, false)?;
         let t = match o {

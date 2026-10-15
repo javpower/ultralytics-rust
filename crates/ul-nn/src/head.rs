@@ -480,7 +480,7 @@ impl DetectHead {
         RawPreds { boxes, scores, extra, extra2, proto, proto_sem, feats: x.iter().map(|t| t.shallow_clone()).collect() }
     }
 
-    fn nk(&self) -> i64 {
+    pub fn nk(&self) -> i64 {
         self.kpt_shape.0 * self.kpt_shape.1
     }
 

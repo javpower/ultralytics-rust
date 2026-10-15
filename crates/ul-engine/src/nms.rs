@@ -173,3 +173,12 @@ pub fn to_tensor(imgs: &[ul_data::image::Img], device: tch::Device) -> Tensor {
     let t = Tensor::from_data_size(&bytes, &[b, 3, h, w], Kind::Float).to_device(device);
     t
 }
+
+/// rect letterbox 目标尺寸：按长宽比缩放到最长边 imgsz，短边 32 对齐。
+pub fn rect_letterbox_size(w: u32, h: u32, imgsz: u32, stride: u32) -> (u32, u32) {
+    let r = (imgsz as f32 / w.max(1) as f32).min(imgsz as f32 / h.max(1) as f32);
+    let nw = ((w as f32 * r).round() as u32).max(stride).min(imgsz);
+    let nh = ((h as f32 * r).round() as u32).max(stride).min(imgsz);
+    let align = |x: u32| ((x + stride - 1) / stride) * stride;
+    (align(nw), align(nh))
+}

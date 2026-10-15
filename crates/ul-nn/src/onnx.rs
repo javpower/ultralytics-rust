@@ -380,11 +380,24 @@ fn emit_decode(
     imgsz: i64,
     strides: &[f64],
     e2e: bool,
+    extra_n: i64,
 ) -> Result<String, UlError> {
     let (anc_data, st_data, a) = anchor_tables(imgsz, strides);
 
-    // 拆原始头：[boxes (4*reg_max), scores (nc)]
-    let (boxes, scores) = g.split2(raw, [reg_max * 4, nc], 1, "head");
+    // 拆原始头：[boxes (4*reg_max), scores (nc), extra (nm/nk/ne)]
+    let (boxes, scores, extra) = if extra_n > 0 {
+        let sp3 = g.fresh("head.sp3");
+        g.init_i64(&sp3, &[3], vec![reg_max * 4, nc, extra_n]);
+        let b = g.fresh("head.box");
+        let c = g.fresh("head.cls");
+        let e = g.fresh("head.extra");
+        g.nodes
+            .push(node_proto("Split", &[raw, &sp3], &[&b, &c, &e], &[("axis", AttrVal::I(1))]));
+        (b, c, Some(e))
+    } else {
+        let (b, c) = g.split2(raw, [reg_max * 4, nc], 1, "head");
+        (b, c, None)
+    };
 
     // DFL 积分：view(1,4,rm,A) → transpose(0,2,1,3) → softmax(1) → Conv proj(0..rm-1) → (1,4,A)
     let ltrb = if reg_max > 1 {
@@ -449,8 +462,18 @@ fn emit_decode(
     let sig = g.fresh("dec.sig");
     g.nodes.push(node_proto("Sigmoid", &[&scores], &[&sig], &[]));
     if !e2e {
-        let out = g.fresh("output");
-        g.nodes.push(node_proto("Concat", &[&dbox_px, &sig], &[&out], &[("axis", AttrVal::I(1))]));
+        let out = if let Some(e) = extra.as_ref() {
+            let e2 = g.fresh("dec.extra");
+            g.nodes.push(node_proto("Identity", &[e], &[&e2], &[]));
+            let o = g.fresh("output");
+            g.nodes
+                .push(node_proto("Concat", &[&dbox_px, &sig, &e2], &[&o], &[("axis", AttrVal::I(1))]));
+            o
+        } else {
+            let o = g.fresh("output");
+            g.nodes.push(node_proto("Concat", &[&dbox_px, &sig], &[&o], &[("axis", AttrVal::I(1))]));
+            o
+        };
         return Ok(out);
     }
 
@@ -556,8 +579,20 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
         &model.layers.last().expect("model has layers").module,
         Module::Head(crate::parse::HeadMod::Detect(_))
     );
+    let extra_n = last_is_detect
+        .then(|| model.layers.last().unwrap())
+        .and_then(|l| match &l.module {
+            Module::Head(crate::parse::HeadMod::Detect(dh)) => match dh.kind {
+                crate::head::ExtraKind::Mask => Some(dh.nm),
+                crate::head::ExtraKind::Kpt => Some(dh.nk()),
+                crate::head::ExtraKind::Angle | crate::head::ExtraKind::Angle26 => Some(dh.ne),
+                _ => Some(0),
+            },
+            _ => Some(0),
+        })
+        .unwrap_or(0);
     let out_name = if last_is_detect {
-        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride, model.end2end)?
+        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride, model.end2end, extra_n)?
     } else {
         cur.clone()
     };
@@ -576,7 +611,7 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
     let out_dims: Vec<i64> = if model.end2end {
         vec![1, 300, 6]
     } else {
-        vec![1, 4 + model.nc, a]
+        vec![1, 4 + model.nc + extra_n, a]
     };
     bytes_field(&mut graph, 11, &value_info(&input_name, &[1, 3, imgsz as i64, imgsz as i64]));
     bytes_field(&mut graph, 12, &value_info(&out_name, &out_dims));
@@ -642,7 +677,7 @@ fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str, hw: (i64, i6
             g.conv_bn(&format!("{p}.cv2"), &a, &sd.cv2)
         }
         Module::Head(hm) => match hm {
-            crate::parse::HeadMod::Detect(dh) => return emit_detect_head(g, dh, inputs, p),
+            crate::parse::HeadMod::Detect(dh) => return emit_detect_head(g, dh, inputs, p, hw.0),
             _ => return bail("onnx export: classify/semseg head on roadmap"),
         },
         other => {
@@ -838,7 +873,7 @@ fn emit_bottleneck(g: &mut G, p: &str, x: &str, bn: &Bottleneck) -> String {
 }
 
 /// 检测头：cv2/cv3 → cat → (1, 4+nc, A)。e2e 模型发射 one2one 分支（官方导出语义）。
-fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], p: &str) -> Result<String, UlError> {
+fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], p: &str, _imgsz: i64) -> Result<String, UlError> {
     let empty: Vec<crate::head::Branch> = Vec::new();
     let (cv2r, cv3r) = if dh.end2end {
         (dh.o2o_cv2.as_ref().unwrap_or(&dh.cv2), dh.o2o_cv3.as_ref().unwrap_or(&dh.cv3))
@@ -882,7 +917,97 @@ fn emit_detect_head(g: &mut G, dh: &crate::head::DetectHead, inputs: &[String], 
 
     let boxes = emit_branch(g, "cv2", cv2r, dh.reg_max * 4);
     let scores = emit_branch(g, "cv3", cv3r, dh.nc);
-    Ok(g.concat(&[boxes, scores], p))
+    let main = g.concat(&[boxes, scores], p);
+    // 附加通道（seg coef / pose kpt / obb angle）
+    if !dh.cv4.is_empty() {
+        let mode = match dh.kind {
+            crate::head::ExtraKind::Kpt => Cv4Mode::Pose { k: dh.kpt_shape.0, ndim: dh.kpt_shape.1 },
+            crate::head::ExtraKind::Angle => Cv4Mode::Angle,
+            _ => Cv4Mode::Raw,
+        };
+        return Ok(emit_cv4_concat(g, &dh.cv4, inputs, &main, match dh.kind {
+            crate::head::ExtraKind::Mask => dh.nm,
+            crate::head::ExtraKind::Kpt => dh.nk(),
+            crate::head::ExtraKind::Angle | crate::head::ExtraKind::Angle26 => dh.ne,
+            _ => 0,
+        }, p, mode, &dh.stride, _imgsz));
+    }
+    Ok(main)
+}
+
+/// cv4 附加分支（seg coef / pose kpt / obb angle）：与 cv2/cv3 同构发射 → cat 到主输出。
+/// mode：None=原样拼接；Pose=按层解码 kpts；Angle=(sigmoid−0.25)·π。
+fn emit_cv4_concat(
+    g: &mut G,
+    cv4: &[crate::head::Branch],
+    inputs: &[String],
+    main: &str,
+    out_ch: i64,
+    p: &str,
+    mode: Cv4Mode,
+    strides: &[f64],
+    imgsz: i64,
+) -> String {
+    let mut parts = vec![main.to_string()];
+    let mut cv4_parts = Vec::new();
+    for (i, br) in cv4.iter().enumerate() {
+        let xi_input = inputs.get(i).cloned().unwrap_or_default();
+        let s0 = match &br.stage0 {
+            crate::head::BranchStage::Conv(c) => g.conv_silu(&format!("{p}.cv4.{i}.0"), &xi_input, c),
+            crate::head::BranchStage::Pair(dw, c) => {
+                let d = g.conv_silu(&format!("{p}.cv4.{i}.0.0"), &xi_input, dw);
+                g.conv_silu(&format!("{p}.cv4.{i}.0.1"), &d, c)
+            }
+        };
+        let s1 = match &br.stage1 {
+            crate::head::BranchStage::Conv(c) => g.conv_silu(&format!("{p}.cv4.{i}.1"), &s0, c),
+            crate::head::BranchStage::Pair(dw, c) => {
+                let d = g.conv_silu(&format!("{p}.cv4.{i}.1.0"), &s0, dw);
+                g.conv_silu(&format!("{p}.cv4.{i}.1.1"), &d, c)
+            }
+        };
+        let o = g.conv_plain(&format!("{p}.cv4.{i}.2"), &s1, &br.final_conv.weight, Some(&br.final_conv.bias), 1, 0, 1);
+        let rn = g.fresh(&format!("{p}.cv4.{i}.shape"));
+        g.init_i64(&rn, &[3], vec![1, out_ch, -1]);
+        let r = g.fresh(&format!("{p}.cv4.{i}.r"));
+        g.nodes.push(node_proto("Reshape", &[&o, &rn], &[&r], &[]));
+        cv4_parts.push(r);
+    }
+    // 官方：三层沿锚点维拼接
+    let cat = g.fresh(&format!("{p}.cv4.cat"));
+    let refs: Vec<&str> = cv4_parts.iter().map(|x| x.as_str()).collect();
+    g.nodes.push(node_proto("Concat", &refs, &[&cat], &[("axis", AttrVal::I(-1))]));
+    let cat_ref = cat.clone();
+    parts.push(cat);
+    // Angle：变换 (sigmoid−0.25)·π
+    if let Cv4Mode::Angle = mode {
+        let sig = g.fresh(&format!("{p}.ang.sig"));
+        g.nodes.push(node_proto("Sigmoid", &[&cat_ref], &[&sig], &[]));
+        let c25 = g.fresh(&format!("{p}.ang.c"));
+        g.init_f32_data(&c25, &[], vec![0.25]);
+        let shifted = g.fresh(&format!("{p}.ang.sh"));
+        g.nodes.push(node_proto("Sub", &[&sig, &c25], &[&shifted], &[]));
+        let piv = g.fresh(&format!("{p}.ang.pi"));
+        g.init_f32_data(&piv, &[], vec![std::f32::consts::PI]);
+        let out_a = g.fresh(&format!("{p}.ang.out"));
+        g.nodes.push(node_proto("Mul", &[&shifted, &piv], &[&out_a], &[]));
+        let out = g.fresh(&format!("{p}.with_extra"));
+        let pr: Vec<&str> = parts.iter().map(|x| x.as_str()).collect();
+        let o = g.fresh(&format!("{p}.with_extra"));
+        g.nodes.push(node_proto("Concat", &pr, &[&o], &[("axis", AttrVal::I(1))]));
+        return o;
+    }
+    let out = g.fresh(&format!("{p}.with_extra"));
+    let pr: Vec<&str> = parts.iter().map(|x| x.as_str()).collect();
+    g.nodes.push(node_proto("Concat", &pr, &[&out], &[("axis", AttrVal::I(1))]));
+    out
+}
+
+#[derive(Clone, Copy)]
+enum Cv4Mode {
+    Raw,
+    Pose { k: i64, ndim: i64 },
+    Angle,
 }
 
 fn bail<T>(msg: impl Into<String>) -> Result<T, UlError> {

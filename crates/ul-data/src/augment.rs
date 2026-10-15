@@ -23,6 +23,12 @@ pub struct AugmentCfg {
     pub mosaic: f64,
     pub mixup: f64,
     pub close_mosaic: usize,
+    /// copy-paste（seg）：候选实例粘贴比例（官方 default 0.0，flip 模式）。
+    pub copy_paste: f64,
+    /// CutMix 概率（官方 default 0.0）。
+    pub cutmix: f64,
+    /// 随机擦除概率（官方 classify 管线，default 0.4）。
+    pub erasing: f64,
 }
 
 impl Default for AugmentCfg {
@@ -42,6 +48,9 @@ impl Default for AugmentCfg {
             mosaic: 1.0,
             mixup: 0.0,
             close_mosaic: 10,
+            copy_paste: 0.0,
+            cutmix: 0.0,
+            erasing: 0.4,
         }
     }
 }
@@ -142,6 +151,13 @@ impl Augmentor {
             for px in sample.img.data.chunks_exact_mut(3) {
                 px.swap(0, 2);
             }
+        }
+        // Copy-Paste（flip 模式，seg）与 CutMix
+        if self.cfg.copy_paste > 0.0 {
+            copy_paste_flip(&mut sample, self.cfg.copy_paste);
+        }
+        if self.cfg.cutmix > 0.0 && rng.bool_p(self.cfg.cutmix) {
+            cutmix_self(&mut sample, &mut rng);
         }
         sample
     }
@@ -556,13 +572,18 @@ pub fn flip_lr(sample: &mut Sample) {
     }
 }
 
-/// letterbox（114 灰边，center=True），返回重排后的图。
+/// letterbox（114 灰边，center=True）：目标可为矩形 (rect_w, rect_h)。
 pub fn letterbox(img: &Img, new_size: u32, color: [u8; 3]) -> Img {
-    let params = LetterboxParams::new(img.w as f32, img.h as f32, new_size as f32, new_size as f32);
+    letterbox_rect(img, new_size, new_size, color)
+}
+
+/// rect 版 letterbox：目标 (rect_w, rect_h)（32 对齐）。
+pub fn letterbox_rect(img: &Img, rect_w: u32, rect_h: u32, color: [u8; 3]) -> Img {
+    let params = LetterboxParams::new(img.w as f32, img.h as f32, rect_w as f32, rect_h as f32);
     let nw = (img.w as f32 * params.gain_w).round() as u32;
     let nh = (img.h as f32 * params.gain_h).round() as u32;
     let resized = img.resize(nw.max(1), nh.max(1));
-    let mut out = Img::new(new_size, new_size);
+    let mut out = Img::new(rect_w, rect_h);
     if color != [0, 0, 0] {
         for px in out.data.chunks_exact_mut(3) {
             px[0] = color[0];
@@ -570,8 +591,8 @@ pub fn letterbox(img: &Img, new_size: u32, color: [u8; 3]) -> Img {
             px[2] = color[2];
         }
     }
-    let ox = ((new_size - nw) / 2) as i32;
-    let oy = ((new_size - nh) / 2) as i32;
+    let ox = ((rect_w - nw) / 2) as i32;
+    let oy = ((rect_h - nh) / 2) as i32;
     for y in 0..nh as i32 {
         for x in 0..nw as i32 {
             let p = resized.pixel(x as u32, y as u32);
@@ -628,4 +649,176 @@ pub fn rasterize_mask(sample: &Sample, imgsz: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+// ---------------- Copy-Paste / CutMix / RandomErasing ----------------
+
+/// Copy-Paste（官方 flip 模式）：把自身实例水平镜像，选与现有框 IoA<0.3 的候选，
+/// 取前 round(p·n) 个，经多边形掩码把镜像像素贴回图上并追加标注。
+pub fn copy_paste_flip(sample: &mut Sample, p: f64) {
+    let (w, h) = (sample.img.w as usize, sample.img.h as usize);
+    if sample.instances.is_empty() || w == 0 || h == 0 {
+        return;
+    }
+    let mut cand: Vec<DetInstance> = sample
+        .instances
+        .iter()
+        .filter(|i| i.segments.len() >= 6)
+        .cloned()
+        .collect();
+    for ins in cand.iter_mut() {
+        ins.xywhn[0] = 1.0 - ins.xywhn[0];
+        for pt in ins.segments.chunks_exact_mut(2) {
+            pt[0] = 1.0 - pt[0];
+        }
+        for k in ins.kpts.chunks_exact_mut(3) {
+            k[0] = 1.0 - k[0];
+        }
+    }
+    if cand.is_empty() {
+        return;
+    }
+    // IoA = inter(候选框, 现有框) / 候选框面积；对全部现有框 IoA<0.3 的才可贴
+    let mut indexes: Vec<usize> = (0..cand.len())
+        .filter(|ci| {
+            let c = &cand[*ci];
+            let (cx0, cx1, cy0, cy1) = (
+                c.xywhn[0] - c.xywhn[2] / 2.0,
+                c.xywhn[0] + c.xywhn[2] / 2.0,
+                c.xywhn[1] - c.xywhn[3] / 2.0,
+                c.xywhn[1] + c.xywhn[3] / 2.0,
+            );
+            let a2 = (c.xywhn[2] * c.xywhn[3]).max(1e-9);
+            sample.instances.iter().all(|o| {
+                let (ox0, ox1, oy0, oy1) = (
+                    o.xywhn[0] - o.xywhn[2] / 2.0,
+                    o.xywhn[0] + o.xywhn[2] / 2.0,
+                    o.xywhn[1] - o.xywhn[3] / 2.0,
+                    o.xywhn[1] + o.xywhn[3] / 2.0,
+                );
+                let iw = (cx1.min(ox1) - cx0.max(ox0)).max(0.0);
+                let ih = (cy1.min(oy1) - cy0.max(oy0)).max(0.0);
+                iw * ih / a2 < 0.30
+            })
+        })
+        .collect();
+    let n_sel = (p * indexes.len() as f64).round() as usize;
+    indexes.truncate(n_sel);
+
+    for &ci in &indexes {
+        let ins = cand[ci].clone();
+        let pts: Vec<[f32; 2]> = ins
+            .segments
+            .chunks_exact(2)
+            .map(|c| [c[0] * w as f32, c[1] * h as f32])
+            .collect();
+        if pts.len() < 3 {
+            continue;
+        }
+        // 标量掩码（扫描线）
+        let mut m = vec![0u8; w * h];
+        for yy in 0..h {
+            let y = yy as f32 + 0.5;
+            let mut xs: Vec<f32> = Vec::new();
+            for i in 0..pts.len() {
+                let a = pts[i];
+                let b = pts[(i + 1) % pts.len()];
+                if (a[1] <= y && b[1] > y) || (b[1] <= y && a[1] > y) {
+                    let t = (y - a[1]) / (b[1] - a[1]);
+                    xs.push(a[0] + t * (b[0] - a[0]));
+                }
+            }
+            xs.sort_by(|p1, p2| p1.partial_cmp(p2).unwrap_or(std::cmp::Ordering::Equal));
+            for pair in xs.chunks(2) {
+                if pair.len() < 2 {
+                    continue;
+                }
+                let x0 = pair[0].max(0.0) as usize;
+                let x1_ = (pair[1].ceil() as usize).min(w);
+                for xx in x0..x1_ {
+                    m[yy * w + xx] = 1;
+                }
+            }
+        }
+        // 贴镜像像素：掩码内 (xx,yy) ← 原图 (w-1-xx, yy)
+        for yy in 0..h {
+            for xx in 0..w {
+                if m[yy * w + xx] == 1 {
+                    let mx = w - 1 - xx;
+                    let src = sample.img.pixel(mx as u32, yy as u32);
+                    let k = (yy * w + xx) * 3;
+                    sample.img.data[k..k + 3].copy_from_slice(&src);
+                }
+            }
+        }
+        sample.instances.push(ins);
+    }
+}
+
+/// CutMix（官方 _rand_bbox + 区域内标注替换）：随机矩形区域替换为自身镜像区域，
+/// 区域内追加与镜像框相交的 clip 标注，区域外保留原标注。lam ~ U(0,1)（Beta(1,1)）。
+pub fn cutmix_self(sample: &mut Sample, rng: &mut Rng) {
+    let (w, h) = (sample.img.w as i32, sample.img.h as i32);
+    let lam = rng.f32();
+    let cut_frac = (1.0 - lam).sqrt();
+    let cw = ((w as f32 * cut_frac) as i32).clamp(1, w);
+    let ch = ((h as f32 * cut_frac) as i32).clamp(1, h);
+    if cw >= w || ch >= h {
+        return;
+    }
+    let x0 = (rng.range(0.0, (w - cw) as f32) as i32).clamp(0, w - cw);
+    let y0 = (rng.range(0.0, (h - ch) as f32) as i32).clamp(0, h - ch);
+    for yy in y0..y0 + ch {
+        for xx in x0..x0 + cw {
+            let mx = (w - 1 - xx).max(0);
+            let my = (h - 1 - yy).max(0);
+            let src = sample.img.pixel(mx as u32, my as u32);
+            sample.img.set_pixel(xx as u32, yy as u32, src);
+        }
+    }
+    let (rw0, rh0, rw1, rh1) = (x0 as f32 / w as f32, y0 as f32 / h as f32, (x0 + cw) as f32 / w as f32, (y0 + ch) as f32 / h as f32);
+    let mut in_region: Vec<DetInstance> = Vec::new();
+    for ins in &sample.instances {
+        let (bx0, bx1, by0, by1) = (
+            ins.xywhn[0] - ins.xywhn[2] / 2.0,
+            ins.xywhn[0] + ins.xywhn[2] / 2.0,
+            ins.xywhn[1] - ins.xywhn[3] / 2.0,
+            ins.xywhn[1] + ins.xywhn[3] / 2.0,
+        );
+        let ix0 = bx0.max(rw0);
+        let iy0 = by0.max(rh0);
+        let ix1 = bx1.min(rw1);
+        let iy1 = by1.min(rh1);
+        if ix1 - ix0 > 0.005 && iy1 - iy0 > 0.005 {
+            let mut nins = ins.clone();
+            nins.xywhn = [(ix0 + ix1) / 2.0, (iy0 + iy1) / 2.0, ix1 - ix0, iy1 - iy0];
+            in_region.push(nins);
+        }
+    }
+    sample
+        .instances
+        .retain(|ins| !(ins.xywhn[0] + ins.xywhn[2] / 2.0 > rw0 && ins.xywhn[0] - ins.xywhn[2] / 2.0 < rw1
+            && ins.xywhn[1] + ins.xywhn[3] / 2.0 > rh0 && ins.xywhn[1] - ins.xywhn[3] / 2.0 < rh1));
+    sample.instances.extend(in_region);
+}
+
+/// 随机擦除（classify 管线，官方 erasing=0.4）：随机矩形置 0。
+/// r0..r3 为调用方随机源（ul-data 不依赖 rand crate）。
+pub fn random_erasing(sample: &mut Sample, p: f64, r0: f32, r1: f32, r2: f32, r3: f32) {
+    if r0 as f64 >= p {
+        return;
+    }
+    let (w, h) = (sample.img.w, sample.img.h);
+    let ew = ((r1 * 0.33).max(0.02) * w as f32) as u32;
+    let eh = ((r2 * 0.33).max(0.02) * h as f32) as u32;
+    let x0 = (r3 * (w - ew).max(1) as f32) as u32;
+    let y0 = (r3 * (h - eh).max(1) as f32) as u32;
+    for yy in y0..(y0 + eh).min(h) {
+        for xx in x0..(x0 + ew).min(w) {
+            let k = ((yy * w + xx) * 3) as usize;
+            sample.img.data[k] = 0;
+            sample.img.data[k + 1] = 0;
+            sample.img.data[k + 2] = 0;
+        }
+    }
 }

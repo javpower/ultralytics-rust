@@ -128,17 +128,25 @@ CUDA：libtorch CUDA 版即可（`tch` 运行时探测），无卡自动回退 C
 
 ## 已知边界（诚实清单）
 
-- **训练侧未实现**：AMP（fp16 autocast）、多卡 DDP、rect（最小矩形）训练与推理
-- **增强未实现**：copy_paste、erasing、cutout（mosaic/mixup/透视/HSV/翻转/BGR/
-  close_mosaic 已实现且可透传）
+- **训练侧未实现**：AMP（fp16 autocast——tch 绑定未暴露 autocast 上下文）、
+  多卡 DDP（tch 未暴露 c10d）；**rect 推理已实现**（predict 32 对齐矩形
+  letterbox），rect 训练（宽高比分批）未实现
+- **增强**：copy_paste（flip 模式，IoA<0.3 过滤 + 多边形掩码贴像素）、cutmix、
+  erasing（classify 管线）已实现并透传（CLI copy_paste=/cutmix=/erasing=）；
+  copy_paste 的 mixup 模式未实现
 - **任务面**：detect/classify/segment/pose/obb 训练+评测闭环全通；**三任务损失
   全部分量与官方 8.4.157 逐位/精确对齐**（seg/pose/obb 的 detect 分量 + seg/kobj/
   angle/pose 附加分量）；官方 pt 推理加载支持 ckpt nc 覆盖（obb=DOTA 15 等）；
   yolo26 训练语义未与官方曲线对拍
-- **ONNX 导出**：detect 家族全覆盖——v5-v11 标准 Detect（图内解码）+ v10/yolo26
-  e2e（图内两级 topk→(1,300,6)）+ PSA 注意力族（Psa/C2PSA/C2fPSA/BottleneckPsa）；
-  seg/pose/obb 头导出与 A2C2f（v12）显式报错（roadmap）；v10 官方权重资产缺失，
-  e2e 数值对拍以图结构 + ORT 校验为准
+- **ONNX 导出**：v5-v11 标准 Detect（图内解码）+ v10/yolo26 e2e（图内两级
+  topk→(1,300,6)）+ PSA 注意力族 + **seg/pose/obb 附加通道**（seg (1,116,A)
+  含 coef、pose (1,56,A)、obb (1,85,A) 含变换角度，checker+ORT 通过）；
+  pose 的 kpt 通道导出为原始 logits（图内 (y·2+anchor−0.5)·stride 解码待完善）；
+  A2C2f（v12）显式报错（roadmap）
+- **数据集缓存**：labels 解析结果持久化 cache.json（构造时全量解析一次，
+  二次启动零解析；条目数不匹配自动失效重建）
+- **classify 训练**：需要目录布局数据集（images/class/*.jpg）支持，COCO 风格
+  txt 标签的 classify 训练语义未定义（官方也是分目录），当前会得到错误标注
 - **曲线级对拍**：与官方 trainer 的逐 epoch 收敛对比脚本见
   `scripts/curve_parity.py`（同参数同数据双方训练），尚未跑 COCO 全量基准
 - **pickle VM**：支持 torch.save 协议 2-4 的 torch 标准子集；
