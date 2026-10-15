@@ -87,21 +87,23 @@ pub fn bbox_iou(box1: &Tensor, box2: &Tensor, giou: bool, diou: bool, ciou: bool
     let mut iou = &inter / &union;
     if giou || diou || ciou {
         let cw = a2.maximum(&b2) - a1.minimum(&b1); // 包围盒 (N,M,2)
-        let c_area = cw.select(2, 0) * cw.select(2, 1) + eps;
         if giou {
+            let c_area = cw.select(2, 0) * cw.select(2, 1) + eps;
             iou = &iou - ((&c_area - &union) / &c_area);
         }
         if ciou || diou {
+            // 官方：c2 = 对角线平方（cw²+ch²），rho² = (dx²+dy²)/4
+            let c2 = cw.select(2, 0).pow_tensor_scalar(2.0) + cw.select(2, 1).pow_tensor_scalar(2.0) + eps;
             let d = b1 + b2 - a1 - a2;
-            let rho2 = (d.select(2, 0) * d.select(2, 0)) + (d.select(2, 1) * d.select(2, 1));
-            iou = &iou - (rho2 / c_area);
+            let rho2 = (d.select(2, 0) * d.select(2, 0) + d.select(2, 1) * d.select(2, 1)) / 4.0;
+            iou = &iou - rho2 / c2;
         }
         if ciou {
             // 官方 v = (4/π²)(arctan(w2/h2) − arctan(w1/h1))²，其中 w/h 取各自分量
-            let w1 = wh_a.select(1, 0).reshape([-1, 1]);
-            let h1 = wh_a.select(1, 1).reshape([-1, 1]);
-            let w2 = wh_b.select(1, 0).reshape([1, -1]);
-            let h2 = wh_b.select(1, 1).reshape([1, -1]);
+            let w1 = wh_a.select(2, 0).reshape([-1, 1]);
+            let h1 = wh_a.select(2, 1).reshape([-1, 1]);
+            let w2 = wh_b.select(2, 0).reshape([1, -1]);
+            let h2 = wh_b.select(2, 1).reshape([1, -1]);
             let v = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0)
                 * (4.0 / std::f64::consts::PI.powi(2));
             let alpha = &v / ((1 - &iou) + &v);
@@ -128,16 +130,17 @@ pub fn bbox_iou_pairwise(box1: &Tensor, box2: &Tensor, ciou: bool) -> Tensor {
     let mut iou = (&inter / &union).clamp(0.0, 1.0); // 退化框防护：IoU 有界
     if ciou {
         let cw = a2.maximum(b2) - a1.minimum(b1);
-        let c_area = cw.select(1, 0) * cw.select(1, 1) + 1e-7;
+        // 官方：c2 = 对角线平方（cw²+ch²），rho² = (dx²+dy²)/4（d = 2×中心距）
+        let c2 = cw.select(1, 0).pow_tensor_scalar(2.0) + cw.select(1, 1).pow_tensor_scalar(2.0) + 1e-7;
         let d = b1 + b2 - a1 - a2;
-        let rho2 = (d.select(1, 0) * d.select(1, 0)) + (d.select(1, 1) * d.select(1, 1));
-        iou = &iou - rho2 / c_area;
+        let rho2 = (d.select(1, 0) * d.select(1, 0) + d.select(1, 1) * d.select(1, 1)) / 4.0;
+        iou = &iou - rho2 / c2;
         let v = ((wh_b.select(1, 0) / wh_b.select(1, 1)).atan()
             - (wh_a.select(1, 0) / wh_a.select(1, 1)).atan())
         .pow_tensor_scalar(2.0)
             * (4.0 / std::f64::consts::PI.powi(2));
         let one_minus: tch::Tensor = 1.0 - &iou;
-        let alpha = &v / (&one_minus + &v);
+        let alpha = &v / (&one_minus + &v + 1e-7);
         iou = &iou - (&v * alpha);
     }
     iou.unsqueeze(1)
@@ -159,18 +162,18 @@ pub fn bbox_iou_ciou_batched(gt: &Tensor, pd: &Tensor, eps: f64) -> Tensor {
     let area_b = wh_b.select(3, 0) * wh_b.select(3, 1);
     let union = &area_a + &area_b - &inter + eps;
     let mut iou = &inter / &union;
-    // CIoU
+    // CIoU（官方：c2 = 对角线平方，rho² = (dx²+dy²)/4）
     let cw = a2.maximum(b2) - a1.minimum(b1);
-    let c_area = cw.select(3, 0) * cw.select(3, 1) + eps;
+    let c2 = cw.select(3, 0).pow_tensor_scalar(2.0) + cw.select(3, 1).pow_tensor_scalar(2.0) + eps;
     let d = b1 + b2 - a1 - a2;
-    let rho2 = (d.select(3, 0) * d.select(3, 0)) + (d.select(3, 1) * d.select(3, 1));
-    iou = &iou - rho2 / c_area;
+    let rho2 = (d.select(3, 0) * d.select(3, 0) + d.select(3, 1) * d.select(3, 1)) / 4.0;
+    iou = &iou - rho2 / c2;
     let w1 = wh_a.select(3, 0).unsqueeze(2); // (bs, m, 1)
     let h1 = wh_a.select(3, 1).unsqueeze(2);
     let w2 = wh_b.select(3, 0).unsqueeze(1); // (bs, 1, A)
     let h2 = wh_b.select(3, 1).unsqueeze(1);
     let v = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0) * (4.0 / std::f64::consts::PI.powi(2));
-    let alpha = &v / ((1 - &iou) + &v);
+    let alpha = &v / ((1 - &iou) + &v + eps);
     iou = &iou - (v * alpha);
     iou
 }

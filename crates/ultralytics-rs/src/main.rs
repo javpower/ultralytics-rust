@@ -78,6 +78,22 @@ fn main() -> anyhow::Result<()> {
         "train" => {
             let data = get("data").ok_or_else(|| anyhow::anyhow!("data= required"))?;
             let data_path = find_cfg_path(&data);
+            // 增强超参透传（default.yaml Hyperparameters 段；未指定的键取官方默认值）
+            let mut augment = ul_data::augment::AugmentCfg::default();
+            augment.hsv_h = getf("hsv_h", augment.hsv_h);
+            augment.hsv_s = getf("hsv_s", augment.hsv_s);
+            augment.hsv_v = getf("hsv_v", augment.hsv_v);
+            augment.degrees = getf("degrees", augment.degrees);
+            augment.translate = getf("translate", augment.translate);
+            augment.scale = getf("scale", augment.scale);
+            augment.shear = getf("shear", augment.shear);
+            augment.perspective = getf("perspective", augment.perspective);
+            augment.flipud = getf("flipud", augment.flipud);
+            augment.fliplr = getf("fliplr", augment.fliplr);
+            augment.bgr = getf("bgr", augment.bgr);
+            augment.mosaic = getf("mosaic", augment.mosaic);
+            augment.mixup = getf("mixup", augment.mixup);
+            augment.close_mosaic = geti("close_mosaic", augment.close_mosaic as i64) as usize;
             let cfg = TrainCfg {
                 epochs: geti("epochs", 100) as usize,
                 batch: geti("batch", 16) as usize,
@@ -93,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                 device,
                 seed: geti("seed", 0) as u64,
                 workers: geti("workers", 8) as usize,
-                close_mosaic: geti("close_mosaic", 10) as usize,
+                augment,
                 val_interval: 1,
                 project: PathBuf::from(get("project").unwrap_or_else(|| "runs".into())),
                 name: get("name").unwrap_or_else(|| "train".into()),
@@ -201,7 +217,18 @@ fn main() -> anyhow::Result<()> {
                     let out = get("save_dir").unwrap_or_else(|| "runs/export".into());
                     let imgsz = geti("imgsz", 640) as u32;
                     let path = ul_nn::onnx::export_onnx(&model, imgsz, Path::new(&out))?;
-                    println!("exported onnx → {}", path.display());
+                    // 按模型文件名命名（嵌入 yaml 的 yaml_file 可能不带 scale 后缀）
+                    let stem = Path::new(&model_name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("model");
+                    let want = Path::new(&out).join(format!("{stem}.onnx"));
+                    if want != path && stem != "model" {
+                        std::fs::rename(&path, &want)?;
+                        println!("exported onnx → {}", want.display());
+                    } else {
+                        println!("exported onnx → {}", path.display());
+                    }
                 }
                 f => anyhow::bail!("unsupported export format '{f}' (supported: safetensors, onnx)"),
             }

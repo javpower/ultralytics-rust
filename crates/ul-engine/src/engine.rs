@@ -38,7 +38,8 @@ pub struct TrainCfg {
     pub device: Device,
     pub seed: u64,
     pub workers: usize,
-    pub close_mosaic: usize,
+    /// 增强超参（hsv/flip/mosaic/mixup/透视全套，CLI 可透传）。
+    pub augment: AugmentCfg,
     pub val_interval: usize,
     pub project: PathBuf,
     pub name: String,
@@ -64,7 +65,7 @@ impl Default for TrainCfg {
             device: Device::cuda_if_available(),
             seed: 0,
             workers: 8,
-            close_mosaic: 10,
+            augment: AugmentCfg::default(),
             val_interval: 1,
             project: PathBuf::from("runs"),
             name: "train".into(),
@@ -83,10 +84,11 @@ pub struct ModelEma {
 
 impl ModelEma {
     pub fn new(model: &YoloModel) -> Self {
+        // 影子权重存模型同设备（逐迭代更新，避免每批跨设备搬运）；clone 保证深拷贝
         let vars = model.vs.variables();
         let ema: std::collections::HashMap<String, Tensor> = vars
             .iter()
-            .map(|(n, t)| (n.clone(), t.to_device(Device::Cpu).to_kind(Kind::Float)))
+            .map(|(n, t)| (n.clone(), t.f_to_dtype(t.kind(), false, true).unwrap()))
             .collect();
         ModelEma { ema, decay: 0.9999 }
     }
@@ -97,8 +99,7 @@ impl ModelEma {
         tch::no_grad(|| {
             for (n, t) in &vars {
                 if let Some(e) = self.ema.get_mut(n) {
-                    let cur = t.to_device(Device::Cpu).to_kind(Kind::Float);
-                    let new = e.shallow_clone() * self.decay + cur * (1.0 - self.decay);
+                    let new = e.shallow_clone() * self.decay + t * (1.0 - self.decay);
                     let _ = e.copy_(&new);
                 }
             }
@@ -194,6 +195,8 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
     .map_err(|e| UlError::Msg(format!("optimizer: {e}")))?;
 
     let assigner = TaskAlignedAssigner { topk: 10, num_classes: nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    // 官方 E2EDetectLoss：one2one 分支用 topk=1 的独立分配器
+    let assigner_o2o = TaskAlignedAssigner { topk: 1, num_classes: nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
     let lw = LossW::default();
     let mut ema = ModelEma::new(model);
     let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
@@ -219,8 +222,8 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
         let mut order: Vec<usize> = (0..train_ds.len()).collect();
         order.shuffle(&mut rng);
 
-        let close_mosaic_on = cfg.epochs.saturating_sub(epoch) > cfg.close_mosaic;
-        let mut acfg = AugmentCfg::default();
+        let close_mosaic_on = cfg.epochs.saturating_sub(epoch) > cfg.augment.close_mosaic;
+        let mut acfg = cfg.augment.clone();
         if !close_mosaic_on {
             acfg.mosaic = 0.0;
             acfg.mixup = 0.0;
@@ -241,6 +244,7 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
 
         let load = |i: usize| train_ds.load(i).ok();
         let mut epoch_loss = 0f64;
+        let (mut ep_box, mut ep_cls, mut ep_dfl) = (0f64, 0f64, 0f64);
         let mut it = 0usize;
         for chunk in order.chunks(cfg.batch) {
             let ni = epoch * nb + it;
@@ -311,15 +315,18 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                         ModelOutput::Detect(h) => h,
                         _ => panic!("train only detect/classify for now"),
                     };
-                    let loss = v8_detection_loss(model, lw, &assigner, &head_out, &batch, e2e);
-                    opt.backward_step_clip_norm(&loss, 10.0);
-                    epoch_loss += f64::try_from(&loss).unwrap_or(0.0);
+                    let det = v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e);
+                    opt.backward_step_clip_norm(&det.total, 10.0);
+                    epoch_loss += f64::try_from(&det.total).unwrap_or(0.0);
+                    ep_box += det.parts.box_;
+                    ep_cls += det.parts.cls;
+                    ep_dfl += det.parts.dfl;
                 }
             }
             it += 1;
+            ema.update(model, epoch * nb + it);
         }
         epochs_done = epoch + 1;
-        ema.update(model, epoch * nb + it);
 
         // 验证
         let do_val = val_ds.is_some() && (epoch + 1) % cfg.val_interval.max(1) == 0;
@@ -328,10 +335,13 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             ema.apply_to(model);
             let metrics = validate_model(model, val, cfg.imgsz, cfg.device, &names)?;
             log::info!(
-                "epoch {}/{} loss={:.4} P={:.4} R={:.4} mAP50={:.4} mAP50-95={:.4}",
+                "epoch {}/{} loss={:.4} (box={:.3} cls={:.3} dfl={:.3}) P={:.4} R={:.4} mAP50={:.4} mAP50-95={:.4}",
                 epoch + 1,
                 cfg.epochs,
                 epoch_loss / it.max(1) as f64,
+                ep_box / it.max(1) as f64,
+                ep_cls / it.max(1) as f64,
+                ep_dfl / it.max(1) as f64,
                 metrics.mp,
                 metrics.mr,
                 metrics.map50,
@@ -341,9 +351,12 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             use std::io::Write;
             writeln!(
                 metrics_log,
-                "{{\"epoch\":{},\"loss\":{:.4},\"P\":{:.4},\"R\":{:.4},\"mAP50\":{:.4},\"mAP50-95\":{:.4}}}",
+                "{{\"epoch\":{},\"loss\":{:.4},\"box\":{:.4},\"cls\":{:.4},\"dfl\":{:.4},\"P\":{:.4},\"R\":{:.4},\"mAP50\":{:.4},\"mAP50-95\":{:.4}}}",
                 epoch + 1,
                 epoch_loss / it.max(1) as f64,
+                ep_box / it.max(1) as f64,
+                ep_cls / it.max(1) as f64,
+                ep_dfl / it.max(1) as f64,
                 metrics.mp,
                 metrics.mr,
                 metrics.map50,
@@ -360,7 +373,15 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                 break;
             }
         } else {
-            log::info!("epoch {}/{} loss={:.4}", epoch + 1, cfg.epochs, epoch_loss / it.max(1) as f64);
+            log::info!(
+                "epoch {}/{} loss={:.4} (box={:.3} cls={:.3} dfl={:.3})",
+                epoch + 1,
+                cfg.epochs,
+                epoch_loss / it.max(1) as f64,
+                ep_box / it.max(1) as f64,
+                ep_cls / it.max(1) as f64,
+                ep_dfl / it.max(1) as f64
+            );
         }
     }
     // 最后保存 last

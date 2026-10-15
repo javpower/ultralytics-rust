@@ -88,9 +88,9 @@ impl TaskAlignedAssigner {
         let pos_align_metrics = align_metric.amax_last(-1, true); // (bs, m, 1)
         overlaps = overlaps * mask_pos;
         let pos_overlaps = overlaps.amax_last(-1, true); // (bs, m, 1)
-        let normed = align_metric * pos_overlaps / (pos_align_metrics + self.eps);
+        let normed = &align_metric * &pos_overlaps / (&pos_align_metrics + self.eps);
         let norm_align_metric = normed.amax_last(-2, false).unsqueeze(-1).clamp(0.0, 1.0); // (bs, A, 1)
-        let target_scores = (target_scores * norm_align_metric).clamp(0.0, 1.0);
+        let target_scores = (target_scores * &norm_align_metric).clamp(0.0, 1.0);
 
         AssignOut {
             target_labels,
@@ -106,9 +106,8 @@ impl TaskAlignedAssigner {
         let bs = gt_bboxes.size()[0];
         let m = gt_bboxes.size()[1];
         let a = anc_points.size()[1];
-        let device = gt_bboxes.device();
         // 小框放大：wh < stride_val → stride_val
-        let mut xywh = xyxy_to_xywh(gt_bboxes);
+        let xywh = xyxy_to_xywh(gt_bboxes);
         let wh = xywh.narrow(2, 2, 2);
         let small = wh.lt(self.stride_val).logical_and(&mask_gt.to_kind(Kind::Bool));
         let wh_fixed = small.to_kind(Kind::Float) * self.stride_val + (1.0 - small.to_kind(Kind::Float)) * wh;
@@ -167,17 +166,17 @@ impl TaskAlignedAssigner {
         let scores_sel = batched_select3(&ps, &b_idx, &lbl_k, &a_idx);
         let gt_sel = batched_select2(gt_bboxes, &b_idx, &g_idx); // (K, 4)
         let pd_sel = batched_select2(pd_bboxes, &b_idx, &a_idx); // (K, 4)
-        // 成对 CIoU（K 对）
-        let ov = crate::ops::bbox_iou_pairwise(&gt_sel, &pd_sel, true).squeeze_dim(1); // (K,)
+        // 成对 CIoU（K 对）；官方 iou_calculation 末尾 clamp_(0)（负 CIoU 在 ^β 下会翻正）
+        let ov = crate::ops::bbox_iou_pairwise(&gt_sel, &pd_sel, true).squeeze_dim(1).clamp_min(0.0); // (K,)
         let align_vals = scores_sel.pow_tensor_scalar(self.alpha) * ov.pow_tensor_scalar(self.beta);
 
-        let overlaps = zeros.shallow_clone().index_put_(
+        // 两个独立零张量：shallow_clone 共享存储会让 overlaps/align 相互覆盖
+        let overlaps = Tensor::zeros(shape, (Kind::Float, pd_bboxes.device())).index_put_(
             &[Some(&b_idx), Some(&g_idx), Some(&a_idx)],
             &ov,
             false,
         );
-        let mut zeros = zeros;
-        let align = zeros.index_put_(
+        let align = Tensor::zeros(shape, (Kind::Float, pd_scores.device())).index_put_(
             &[Some(&b_idx), Some(&g_idx), Some(&a_idx)],
             &align_vals,
             false,
@@ -188,7 +187,6 @@ impl TaskAlignedAssigner {
     /// topk 候选（官方 scatter_add 计数，重复置 0）。
     fn select_topk_candidates(&self, metrics: &Tensor, topk_mask: Option<&Tensor>) -> Tensor {
         let (topk_metrics, topk_idxs) = metrics.topk(self.topk, -1, true, true); // (bs, m, topk)
-        let zeros = Tensor::zeros([], (Kind::Int64, topk_idxs.device())).expand(topk_idxs.size(), true);
         let masked_idxs = match topk_mask {
             Some(tm) => {
                 let tm = tm.to_kind(Kind::Bool);

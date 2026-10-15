@@ -204,6 +204,12 @@ impl G {
 
     /// Conv（BN 融合）+ SiLU。
     fn conv_silu(&mut self, p: &str, x: &str, c: &Conv) -> String {
+        let y = self.conv_bn(p, x, c);
+        self.silu(&y, p)
+    }
+
+    /// Conv（BN 融合），不带激活（SPPF cv1 / SCDown cv2 等 act=False 的卷积）。
+    fn conv_bn(&mut self, p: &str, x: &str, c: &Conv) -> String {
         let (w, bias) = c.fused_conv();
         let wn = self.fresh(&format!("{p}.w"));
         self.init_f32(&wn, &w);
@@ -221,7 +227,7 @@ impl G {
                 ("group", AttrVal::I(c.conv.groups)),
             ],
         ));
-        self.silu(&y, p)
+        y
     }
 
     fn silu(&mut self, x: &str, hint: &str) -> String {
@@ -282,7 +288,12 @@ impl G {
             "Resize",
             &[x, "", &scales],
             &[&y],
-            &[("nearest_mode", AttrVal::S("floor")), ("mode", AttrVal::S("nearest"))],
+            &[
+                // torch nn.Upsample nearest 语义 = asymmetric + floor（默认 half_pixel 会错位采样）
+                ("coordinate_transformation_mode", AttrVal::S("asymmetric")),
+                ("nearest_mode", AttrVal::S("floor")),
+                ("mode", AttrVal::S("nearest")),
+            ],
         ));
         y
     }
@@ -308,10 +319,140 @@ impl G {
         self.nodes.push(node_proto("Split", &[x, &sp], &[&a, &b], &[("axis", AttrVal::I(1))]));
         (a, b)
     }
+
+    /// 沿 axis 按给定尺寸拆分（Split-2）。
+    fn split2(&mut self, x: &str, sizes: [i64; 2], axis: i64, hint: &str) -> (String, String) {
+        let sp = self.fresh(&format!("{hint}.sp"));
+        self.init_i64(&sp, &[2], sizes.to_vec());
+        let a = self.fresh(&format!("{hint}.a"));
+        let b = self.fresh(&format!("{hint}.b"));
+        self.nodes.push(node_proto("Split", &[x, &sp], &[&a, &b], &[("axis", AttrVal::I(axis))]));
+        (a, b)
+    }
+
+    /// Reshape（目标形状为 initializer）。
+    fn reshape(&mut self, x: &str, shape: &[i64], hint: &str) -> String {
+        let rs = self.fresh(&format!("{hint}.shape"));
+        self.init_i64(&rs, &[shape.len() as i64], shape.to_vec());
+        let y = self.fresh(&format!("{hint}.rs"));
+        self.nodes.push(node_proto("Reshape", &[x, &rs], &[&y], &[]));
+        y
+    }
 }
 
-/// 导出入口。
+/// 固定输入尺寸下的锚点表（官方 make_anchors(feats, strides, 0.5)）：
+/// 返回 ((1,2,A) anchor xy、(1,4,A) 每锚 stride、A)。二者均按 (1,C,A) 行主序布局填充。
+fn anchor_tables(imgsz: i64, strides: &[f64]) -> (Vec<f32>, Vec<f32>, i64) {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut per_anchor = Vec::new();
+    for s in strides {
+        let n = imgsz / (*s as i64);
+        for y in 0..n {
+            for x in 0..n {
+                xs.push(x as f32 + 0.5);
+                ys.push(y as f32 + 0.5);
+            }
+        }
+        for _ in 0..n * n {
+            per_anchor.push(*s as f32);
+        }
+    }
+    let a = xs.len() as i64;
+    let mut anc = xs;
+    anc.extend(ys);
+    // (1,4,A)：通道维在外，每通道重复整张每锚 stride 表
+    let mut st4 = Vec::with_capacity(4 * per_anchor.len());
+    for _ in 0..4 {
+        st4.extend_from_slice(&per_anchor);
+    }
+    (anc, st4, a)
+}
+
+/// 图内解码（官方默认导出语义，Detect._inference）：DFL 积分 + dist2bbox(xywh)×strides +
+/// sigmoid 分数，输出 (1, 4+nc, A)。
+fn emit_decode(
+    g: &mut G,
+    raw: &str,
+    reg_max: i64,
+    nc: i64,
+    imgsz: i64,
+    strides: &[f64],
+) -> Result<String, UlError> {
+    let (anc_data, st_data, a) = anchor_tables(imgsz, strides);
+
+    // 拆原始头：[boxes (4*reg_max), scores (nc)]
+    let (boxes, scores) = g.split2(raw, [reg_max * 4, nc], 1, "head");
+
+    // DFL 积分：view(1,4,rm,A) → transpose(0,2,1,3) → softmax(1) → Conv proj(0..rm-1) → (1,4,A)
+    let ltrb = if reg_max > 1 {
+        let r4 = g.reshape(&boxes, &[1, 4, reg_max, a], "dfl.v");
+        let tp = g.fresh("dfl.t");
+        g.nodes.push(node_proto(
+            "Transpose",
+            &[&r4],
+            &[&tp],
+            &[("perm", AttrVal::Is(vec![0, 2, 1, 3]))],
+        ));
+        let sm = g.fresh("dfl.sm");
+        g.nodes.push(node_proto("Softmax", &[&tp], &[&sm], &[("axis", AttrVal::I(1))]));
+        let proj = g.fresh("dfl.proj");
+        let pw: Vec<f32> = (0..reg_max).map(|i| i as f32).collect();
+        g.init_f32_data(&proj, &[1, reg_max, 1, 1], pw);
+        let cv = g.fresh("dfl.cv");
+        g.nodes.push(node_proto(
+            "Conv",
+            &[&sm, &proj],
+            &[&cv],
+            &[
+                ("strides", AttrVal::Is(vec![1, 1])),
+                ("pads", AttrVal::Is(vec![0, 0, 0, 0])),
+                ("dilations", AttrVal::Is(vec![1, 1])),
+                ("group", AttrVal::I(1)),
+            ],
+        ));
+        g.reshape(&cv, &[1, 4, a], "dfl.out")
+    } else {
+        boxes
+    };
+
+    // dist2bbox(xywh=True)：x1y1 = anc − lt，x2y2 = anc + rb
+    let anc = g.fresh("dec.anc");
+    g.init_f32_data(&anc, &[1, 2, a], anc_data);
+    let st = g.fresh("dec.str");
+    g.init_f32_data(&st, &[1, 4, a], st_data);
+    let (lt, rb) = g.split2(&ltrb, [2, 2], 1, "dec");
+    let x1y1 = g.fresh("dec.x1y1");
+    g.nodes.push(node_proto("Sub", &[&anc, &lt], &[&x1y1], &[]));
+    let x2y2 = g.fresh("dec.x2y2");
+    g.nodes.push(node_proto("Add", &[&anc, &rb], &[&x2y2], &[]));
+    let s = g.fresh("dec.sum");
+    g.nodes.push(node_proto("Add", &[&x1y1, &x2y2], &[&s], &[]));
+    let half = g.fresh("dec.half");
+    g.init_f32_data(&half, &[], vec![0.5]);
+    let cxy = g.fresh("dec.cxy");
+    g.nodes.push(node_proto("Mul", &[&s, &half], &[&cxy], &[]));
+    let wh = g.fresh("dec.wh");
+    g.nodes.push(node_proto("Sub", &[&x2y2, &x1y1], &[&wh], &[]));
+    let dbox = g.fresh("dec.dbox");
+    g.nodes.push(node_proto("Concat", &[&cxy, &wh], &[&dbox], &[("axis", AttrVal::I(1))]));
+    let dbox_px = g.fresh("dec.dbox_px");
+    g.nodes.push(node_proto("Mul", &[&dbox, &st], &[&dbox_px], &[]));
+
+    let sig = g.fresh("dec.sig");
+    g.nodes.push(node_proto("Sigmoid", &[&scores], &[&sig], &[]));
+    let out = g.fresh("output");
+    g.nodes.push(node_proto("Concat", &[&dbox_px, &sig], &[&out], &[("axis", AttrVal::I(1))]));
+    Ok(out)
+}
+
+/// 导出入口。输出为官方默认导出语义的解码结果 (1, 4+nc, A)：xywh 像素 + sigmoid 分数。
 pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std::path::PathBuf, UlError> {
+    if model.end2end {
+        return bail(
+            "onnx export: end2end（v10/yolo26）的图内 topk 后处理在 roadmap；请用 format=safetensors",
+        );
+    }
     let mut g = G { nodes: vec![], inits: vec![], tmp: 0 };
     let input_name = "images".to_string();
     let mut cur = input_name.clone();
@@ -335,6 +476,17 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
         cur = out;
     }
 
+    // 标准检测头：追加图内解码（官方默认导出为解码后输出）
+    let last_is_detect = matches!(
+        &model.layers.last().expect("model has layers").module,
+        Module::Head(crate::parse::HeadMod::Detect(_))
+    );
+    let out_name = if last_is_detect {
+        emit_decode(&mut g, &cur, model.reg_max, model.nc, imgsz as i64, &model.stride)?
+    } else {
+        cur.clone()
+    };
+
     // GraphProto 子消息需要各自的 tag：node=1 / initializer=5 / name=2
     let mut graph = Vec::new();
     for node in &g.nodes {
@@ -345,10 +497,11 @@ pub fn export_onnx(model: &YoloModel, imgsz: u32, out_dir: &Path) -> Result<std:
         bytes_field(&mut graph, 5, init);
     }
     // GraphProto.input(11) / output(12) 在 graph 内部
-    let nc_total = model.reg_max * 4 + model.nc; // 原始头输出（DFL 分布 + 类别分数）
+    let out_ch = 4 + model.nc;
+    let a = model.stride.iter().map(|s| (imgsz as f64 / s).powi(2) as i64).sum::<i64>();
     bytes_field(&mut graph, 11, &value_info(&input_name, &[1, 3, imgsz as i64, imgsz as i64]));
-    bytes_field(&mut graph, 12, &value_info(&cur, &[1, nc_total, -1]));
-    let mp = model_proto(&graph, &input_name, &cur, &[1, nc_total, -1]);
+    bytes_field(&mut graph, 12, &value_info(&out_name, &[1, out_ch, a]));
+    let mp = model_proto(&graph, &input_name, &out_name, &[1, out_ch, a]);
     std::fs::create_dir_all(out_dir)?;
     let stem = Path::new(&model.yaml_file)
         .file_stem()
@@ -370,7 +523,8 @@ fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str) -> Result<St
             g.concat(&[a, b], p)
         }
         Module::Sppf(sp) => {
-            let cv1 = g.conv_silu(&format!("{p}.cv1"), x, &sp.cv1);
+            // 官方 SPPF cv1 act=False（legacy 时其后补一次 SiLU）；cv2 带激活
+            let cv1 = g.conv_bn(&format!("{p}.cv1"), x, &sp.cv1);
             let cv1 = if sp.legacy { g.silu(&cv1, p) } else { cv1 };
             let m1 = g.maxpool(&cv1, sp.k, 1, sp.k / 2, &format!("{p}.m1"));
             let m2 = g.maxpool(&m1, sp.k, 1, sp.k / 2, &format!("{p}.m2"));
@@ -400,25 +554,9 @@ fn emit_layer(g: &mut G, layer: &Layer, inputs: &[String], p: &str) -> Result<St
             g.maxpool(x, k, s, pk, p)
         }
         Module::ScDown(sd) => {
+            // 官方 SCDown：cv1 带 SiLU；cv2 act=False（深度卷积下采样）
             let a = g.conv_silu(&format!("{p}.cv1"), x, &sd.cv1);
-            let (w, b) = sd.cv2.fused_conv();
-            let wn = g.fresh(&format!("{p}.cv2.w"));
-            g.init_f32(&wn, &w);
-            let bn = g.fresh(&format!("{p}.cv2.b"));
-            g.init_f32(&bn, &b);
-            let y = g.fresh(&format!("{p}.cv2.y"));
-            g.nodes.push(node_proto(
-                "Conv",
-                &[&a, &wn, &bn],
-                &[&y],
-                &[
-                    ("strides", AttrVal::Is(vec![sd.cv2.conv.stride, sd.cv2.conv.stride])),
-                    ("pads", AttrVal::Is(vec![sd.cv2.conv.pad_h, sd.cv2.conv.pad_w, sd.cv2.conv.pad_h, sd.cv2.conv.pad_w])),
-                    ("dilations", AttrVal::Is(vec![1, 1])),
-                    ("group", AttrVal::I(sd.cv2.conv.groups)),
-                ],
-            ));
-            y
+            g.conv_bn(&format!("{p}.cv2"), &a, &sd.cv2)
         }
         Module::Head(hm) => match hm {
             crate::parse::HeadMod::Detect(dh) => return emit_detect_head(g, dh, inputs, p),
