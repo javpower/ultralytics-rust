@@ -95,7 +95,13 @@ impl TaskAlignedAssigner {
 
         // 1) 框内锚 + 对齐指标（(bs, m, A)）
         let mask_in_gts = if rotated {
-            self.select_candidates_in_gts_rotated(anc_points, gt_bboxes, mask_gt)
+            let m = self.select_candidates_in_gts_rotated(anc_points, gt_bboxes, mask_gt);
+            if std::env::var("UL_OBB_DEBUG").is_ok() {
+                let per = m.sum_dim_intlist(Some(&[2i64][..]), false, Kind::Float);
+                let v = Vec::<f32>::try_from(&per.reshape([-1])).unwrap_or_default();
+                eprintln!("[obb-tal] in_gts={} per={v:?}", v.iter().map(|x| *x as i64).sum::<i64>());
+            }
+            m
         } else {
             self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
         };
@@ -141,7 +147,7 @@ impl TaskAlignedAssigner {
         let bs = gt_xywhr.size()[0];
         let m = gt_xywhr.size()[1];
         let a = anc_points.size()[1];
-        // 小框放大：wh < stride_val → stride_val
+        // 小框放大：wh < stride_val → stride_val（官方条件含 mask_gt：padding 空框不放大）
         let wh = gt_xywhr.narrow(2, 2, 2);
         let small = wh.lt(self.stride_val).logical_and(&mask_gt.to_kind(Kind::Bool));
         let wh_fixed = small.to_kind(Kind::Float) * self.stride_val + (1.0 - small.to_kind(Kind::Float)) * wh;
@@ -394,7 +400,7 @@ fn rotated_corners_batched(whr: &Tensor) -> Tensor {
     let (xc, yc) = (whr.narrow(2, 0, 1), whr.narrow(2, 1, 1));
     let cos = whr.narrow(2, 4, 1).cos();
     let sin = whr.narrow(2, 4, 1).sin();
-    let (w, h) = (whr.narrow(2, 2, 1), whr.narrow(2, 3, 1));
+    let (w, h) = (whr.narrow(2, 2, 1) / 2.0, whr.narrow(2, 3, 1) / 2.0); // 半宽/半高
     let (ux, uy) = (&w * &cos, &w * &sin);
     let (vx, vy) = (-&h * &sin, &h * &cos);
     let mk = |sx: &Tensor, sy: &Tensor| -> Tensor {

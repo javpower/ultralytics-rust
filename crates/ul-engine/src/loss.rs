@@ -464,7 +464,7 @@ pub fn segmentation_mask_loss(
 ) -> Tensor {
     let (bs, nm, mh, mw) = (proto.size()[0], proto.size()[1], proto.size()[2], proto.size()[3]);
     let (gh, gw) = (gt_masks.size()[1], gt_masks.size()[2]);
-    let _ = (mh, mw, imgsz);
+    let imgsz_f = Tensor::from_slice(&[imgsz as f32]);
     let mut loss = proto.zeros_like().sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
     let mut total_fg = 0f64;
     for i in 0..bs {
@@ -507,8 +507,8 @@ pub fn segmentation_mask_loss(
             mxyxy.narrow(1, 2, 1),
             mxyxy.narrow(1, 3, 1),
         );
-        let wh = Tensor::cat(&[&x2 - &x1, &y2 - &y1], 1);
-        let area = wh.select(1, 0).unsqueeze(1) * wh.select(1, 1).unsqueeze(1) + 1e-9; // (nf,1)
+        // 官方 marea：归一化 xywh 的 wh 积（0.3×0.4≈0.12 量级）
+        let area = (bb.narrow(1, 2, 1) / &imgsz_f) * (bb.narrow(1, 3, 1) / &imgsz_f) + 1e-9; // (nf,1)
         // crop：bbox 外置 0
         let pr = Tensor::arange(gh, (Kind::Float, pred_mask.device())).unsqueeze(0); // (1,gh)
         let pc = Tensor::arange(gw, (Kind::Float, pred_mask.device())).unsqueeze(0);
@@ -559,7 +559,8 @@ pub fn pose_keypoints_loss(
     let xy = pa.narrow(3, 0, 2) * 2.0 + (anc - 0.5); // (B, A, K, 2) 格单位
 
     let zero = xy.zeros_like().sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
-    let (mut kpt_loss, mut kobj_loss) = (zero.shallow_clone(), zero);
+    let (mut kpt_sum, mut kobj_sum) = (zero.shallow_clone(), zero);
+    let mut total_fg = 0f64;
     let mut any_fg = false;
 
     for i in 0..b {
@@ -569,6 +570,7 @@ pub fn pose_keypoints_loss(
             continue;
         }
         any_fg = true;
+        total_fg += nfg;
         let nz = fg.nonzero().squeeze_dim(1);
         let mask_idx = info.target_gt_idx.get(i).index_select(0, &nz); // (nf_i,)
         let rows = batch_idx.eq(i).to_kind(Kind::Int64).nonzero().squeeze_dim(1); // (n_i,)
@@ -603,7 +605,7 @@ pub fn pose_keypoints_loss(
         let kft: Tensor = k as f32 / (kmask.gt(0.0).to_kind(Kind::Float).sum_dim_intlist(Some(&[1i64][..]), false, Kind::Float) + 1e-9); // (nf,)
         let exp_term: Tensor = (-&e).exp() * -1.0 + 1.0;
         let term = &kft.unsqueeze(1) * &(exp_term * &kmask); // (nf,K)
-        kpt_loss = &kpt_loss + term.mean_dim(None::<&[i64]>, false, Kind::Float);
+        kpt_sum = &kpt_sum + term.sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
         if let Some(vt0) = gv.as_ref() {
             let mut parts = Vec::new();
             for kj in 0..ki {
@@ -617,15 +619,20 @@ pub fn pose_keypoints_loss(
             let ones_c: Tensor = &pv_c * 0.0 + 1.0;
             let one_v: Tensor = &ones_c - &vt;
             let pv1: Tensor = &ones_c - &pv_c;
+            let ones_c: Tensor = &pv_c * 0.0 + 1.0;
+            let one_v: Tensor = &ones_c - &vt;
+            let pv1: Tensor = &ones_c - &pv_c;
             let bce = -(&vt * pv_c.log() + one_v * pv1.log());
             let cnt = Tensor::from_slice(&[nfg as f32 * k as f32]);
-            kobj_loss = &kobj_loss + bce.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / &cnt;
+            kobj_sum = &kobj_sum + bce.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / &cnt;
         }
     }
     if !any_fg {
-        kpt_loss = &kpt_loss + pred_kpts_raw.narrow(1, 0, 0).sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
+        kpt_sum = &kpt_sum + pred_kpts_raw.narrow(1, 0, 0).sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
+        return (kpt_sum, kobj_sum);
     }
-    (kpt_loss, kobj_loss)
+    let cnt = Tensor::from_slice(&[total_fg as f32 * k as f32]);
+    (kpt_sum / &cnt, kobj_sum / &cnt)
 }
 
 // ---------------- OBB 损失（v8OBBLoss） ----------------
@@ -682,6 +689,10 @@ pub fn obb_branch_loss(
     }
     let fg_mask = out.fg_mask;
     let tss = out.target_scores.sum_dim_intlist(None::<&[i64]>, false, Kind::Float).clamp_min(1.0);
+    if std::env::var("UL_OBB_DEBUG").is_ok() {
+        let f = |t: &Tensor| f64::try_from(&t.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
+        eprintln!("[obb] fg={} ts_sum={:.6}", f(&fg_mask), f(&out.target_scores));
+    }
 
     let logits_t = preds.scores.transpose(1, 2).contiguous();
     let cls_loss = bce_sum(&logits_t, &out.target_scores) / tss.shallow_clone() * w.cls;
@@ -783,8 +794,12 @@ fn prepare_targets_obb(lb: &Tensor, bs: i64, imgsz: f64) -> (Tensor, Tensor, Ten
     }
     let idx = lb.select(1, 0).to_kind(Kind::Int64);
     let cls = lb.select(1, 1).reshape([-1, 1]).to_kind(Kind::Float);
-    let whr = lb.narrow(1, 2, 5) * imgsz; // 像素（c 一并 ×imgsz，同官方 preprocess）
-    let keep = whr.narrow(1, 2, 1).gt(2.0).logical_and(&whr.narrow(1, 3, 1).gt(2.0)).to_kind(Kind::Int64);
+    // 官方 preprocess：仅 cx,cy,w,h ×imgsz（列 0..4），角度保持
+    let cxywh = lb.narrow(1, 2, 4) * imgsz;
+    let ang = lb.narrow(1, 6, 1);
+    let whr = Tensor::cat(&[cxywh, ang], 1);
+    // 官方过滤 rw,rh≥2（wh 列，labels 里为第 4/5 列）
+    let keep = whr.narrow(1, 4 - 2, 1).gt(2.0).logical_and(&whr.narrow(1, 5 - 2, 1).gt(2.0)).to_kind(Kind::Int64);
     let keep_rows = keep.reshape([-1]).nonzero().squeeze_dim(1);
     if std::env::var("UL_LOSS_DEBUG").is_ok() {
         eprintln!("[obbt] keep_rows={:?} idx={:?}", keep_rows.size(), idx.size());
