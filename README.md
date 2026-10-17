@@ -19,6 +19,39 @@ yolo detect val data=coco8.yaml model=yolov8n.pt
 yolo detect export model=yolov8n.pt format=onnx imgsz=640
 ```
 
+## 作为 crate 依赖（在你的项目里训练/推理）
+
+```toml
+[dependencies]
+ultralytics-rust = "0.1"
+```
+
+```rust
+use ultralytics_rust::prelude::*;
+
+fn main() -> anyhow::Result<()> {
+    // 官方权重直接加载（48 个模型 YAML 已内嵌，开箱即用）
+    let mut model = YoloModel::build("yolo26n", Some(80), Device::Cpu, true)?;
+
+    // 训练
+    let cfg = TrainCfg { epochs: 100, imgsz: 640, ..Default::default() };
+    let report = ul_engine::train(&mut model, std::path::Path::new("coco8.yaml"), &cfg)?;
+    println!("mAP50-95 = {:.4}", report.final_metrics.map50_95);
+
+    // 推理
+    let dets = ul_engine::predict(&model, &[std::path::PathBuf::from("image.jpg")], 640, Device::Cpu, 0.25, None)?;
+    for o in &dets {
+        for d in &o.dets {
+            println!("cls={} conf={:.2} box={:?}", d.cls, d.score, d.xyxy);
+        }
+    }
+    Ok(())
+}
+```
+
+> 也可只用子 crate（`ultralytics-rust-nn` 纯架构/权重加载、`ultralytics-rust-engine` 训练引擎等），
+> 按需取用。
+
 ## 支持范围
 
 **模型家族**（官方 YAML 驱动，`ultralytics/cfg/models/**` 直接嵌入二进制，119 个文件）：

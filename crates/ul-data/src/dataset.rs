@@ -61,6 +61,8 @@ pub struct YoloDataset {
     pub task: TaskKind,
     /// 解析缓存（label 文件名 → 数值行）；cache.json 持久化，二次启动零解析。
     pub cache: std::collections::HashMap<String, Vec<Vec<f32>>>,
+    /// cache="ram"（官方语义）：预解码 + 按 imgsz 等比预缩的图像；None=该图未命中。
+    pub ram_cache: Vec<Option<Img>>,
 }
 
 impl YoloDataset {
@@ -109,7 +111,7 @@ impl YoloDataset {
         if img_files.is_empty() {
             return Err(UlError::Msg(format!("no images under {}", img_dir.display())));
         }
-        let mut ds = YoloDataset { img_files, label_files, names, kpt_dim, task, cache: Default::default() };
+        let mut ds = YoloDataset { img_files, label_files, names, kpt_dim, task, cache: Default::default(), ram_cache: Vec::new() };
         ds.init_cache();
         Ok(ds)
     }
@@ -163,6 +165,7 @@ impl YoloDataset {
             kpt_dim: 0,
             task: TaskKind::Classify,
             cache: labels,
+            ram_cache: Vec::new(),
         };
         ds.names = (0..class_dirs.len()).map(|i| format!("c{i}")).collect();
         Ok(ds)
@@ -193,11 +196,54 @@ impl YoloDataset {
         self.img_files.len()
     }
 
-    /// 加载第 i 个样本（无增强）。
+    /// 加载第 i 个样本（无增强）。RAM 缓存命中则克隆预缩图（省 JPEG 解码）。
     pub fn load(&self, i: usize) -> Result<Sample, UlError> {
-        let img = Img::open(&self.img_files[i])?;
+        let img = if let Some(Some(c)) = self.ram_cache.get(i) {
+            c.clone()
+        } else {
+            Img::open(&self.img_files[i])?
+        };
         let instances = self.load_labels(i);
         Ok(Sample { path: self.img_files[i].clone(), img, instances })
+    }
+
+    /// cache="ram"（官方 load_image 预缩放语义）：一次性解码并按 imgsz 等比
+    /// 预缩（只缩不放），后续 load() 直接克隆缓存图——省去每 epoch 的 JPEG
+    /// 解码，且增强在 imgsz 尺度小图上进行（2448→1280 像素量 ↓4 倍）。
+    /// 标签为归一化坐标，不受预缩影响。
+    pub fn build_ram_cache(&mut self, imgsz: u32) {
+        if !self.ram_cache.is_empty() {
+            return;
+        }
+        let n = self.img_files.len();
+        let mut cache: Vec<Option<Img>> = Vec::with_capacity(n);
+        let mut bytes = 0usize;
+        for p in &self.img_files {
+            let img = match Img::open(p) {
+                Ok(i) => i,
+                Err(_) => {
+                    cache.push(None);
+                    continue;
+                }
+            };
+            let r = imgsz as f32 / (img.w.max(img.h) as f32);
+            let img = if r < 1.0 {
+                let nw = ((img.w as f32 * r).round() as u32).max(1);
+                let nh = ((img.h as f32 * r).round() as u32).max(1);
+                img.resize(nw, nh)
+            } else {
+                img
+            };
+            bytes += img.data.len();
+            cache.push(Some(img));
+        }
+        self.ram_cache = cache;
+        log::info!(
+            "cache=ram: {} images pre-scaled to long-side ≤ {}, {:.2} GB",
+            n,
+            imgsz,
+            bytes as f64 / (1 << 30) as f64
+        );
     }
 
     /// 解析缓存：labels 根目录 cache.json（label 相对路径 → 解析行）。

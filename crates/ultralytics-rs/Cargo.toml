@@ -1,13 +1,21 @@
 [package]
-name = "ultralytics-rs"
+name = "ultralytics-rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "ultralytics_rust"
+path = "src/lib.rs"
 
 [[bin]]
-name = "yolo"
+name = "yolo_core"
 path = "src/main.rs"
 
 [dependencies]

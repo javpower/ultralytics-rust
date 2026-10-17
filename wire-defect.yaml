@@ -1,0 +1,12 @@
+# 真实数据：汽车左门线束工位检测（2448x2048 工业相机原图）
+# 数据源：E:/xunlian/yolo_dataset（526 train / 93 val，4 类）
+# 注意：原始标签为分割多边形格式（该数据集曾用于 yolo26-seg），
+#       训练检测使用 E:/xunlian/yolo_dataset_box（多边形→包围盒转换版，图像已复制）
+path: E:/xunlian/yolo_dataset_box
+train: images/train
+val: images/val
+names:
+  0: 线束
+  1: 锁体
+  2: 限位器
+  3: 防撞块

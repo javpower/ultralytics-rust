@@ -7,13 +7,17 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
 authors = ["ultralytics-rust contributors"]
-description = "A complete Rust reimplementation of Ultralytics YOLO: training, validation, prediction and export for the full YOLO family (v3/v5/v6/v8/v9/v10/v11/v12/v26)."
+description = "A complete pure-Rust reimplementation of Ultralytics YOLO: train, val, predict and export for the full YOLO family (v3/v5/v8/v9/v10/v11/v12/v26), zero Python dependency."
+repository = "https://github.com/javpower/ultralytics-rust"
+readme = "README.md"
+keywords = ["yolo", "ultralytics", "object-detection", "deep-learning", "inference"]
+categories = ["science", "computer-vision", "multimedia::images"]
 
 [workspace.dependencies]
-ul-core = { path = "crates/ul-core", version = "0.1.0" }
-ul-nn = { path = "crates/ul-nn", version = "0.1.0" }
-ul-data = { path = "crates/ul-data", version = "0.1.0" }
-ul-engine = { path = "crates/ul-engine", version = "0.1.0" }
+ul-core = { package = "ultralytics-rust-core", path = "crates/ul-core", version = "0.1.0" }
+ul-nn = { package = "ultralytics-rust-nn", path = "crates/ul-nn", version = "0.1.0" }
+ul-data = { package = "ultralytics-rust-data", path = "crates/ul-data", version = "0.1.0" }
+ul-engine = { package = "ultralytics-rust-engine", path = "crates/ul-engine", version = "0.1.0" }
 
 # ---- 深度学习底座：tch 硬绑定 libtorch 2.11（与官方 PyTorch 同一 C++ 运行时）----
 # 本机已配对 libtorch-cu128-2.11（RTX 5060 Ti 实测通过），设 LIBTORCH 环境变量即可。

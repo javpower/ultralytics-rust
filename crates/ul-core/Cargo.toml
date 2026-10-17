@@ -1,10 +1,17 @@
 [package]
-name = "ul-core"
+name = "ultralytics-rust-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "ul_core"
 
 [dependencies]
 # 仅用于错误类型统一（TchError），core 本身不做张量运算

@@ -182,3 +182,52 @@ pub fn rect_letterbox_size(w: u32, h: u32, imgsz: u32, stride: u32) -> (u32, u32
     let align = |x: u32| ((x + stride - 1) / stride) * stride;
     (align(nw), align(nh))
 }
+
+/// E2E（yolo26 / v10 端到端头）最终检测直通解析。
+/// 输入 t: (B, max_det, 6+extra) = [xyxy(letterbox 像素), score, label, extra…]。
+/// 图内 topk 已完成候选选择与排序；此处仅做 conf 过滤、限幅与装包。
+/// 绝不可再送 non_max_suppression_ex——那会把 [score,label] 两列当 nc 类分数读并越界。
+pub fn parse_e2e_detections(p: &Tensor, cfg: &NmsCfg, b: i64) -> Vec<DetImage> {
+    parse_e2e_with_box_w(p, cfg, b, 4)
+}
+
+/// OBB（xywhr 5 列框）变体：row = [cx,cy,w,h,r, score, label, extra…]
+pub fn parse_e2e_detections_obb(p: &Tensor, cfg: &NmsCfg, b: i64) -> Vec<DetImage> {
+    parse_e2e_with_box_w(p, cfg, b, 5)
+}
+
+fn parse_e2e_with_box_w(p: &Tensor, cfg: &NmsCfg, b: i64, box_w: usize) -> Vec<DetImage> {
+    let cpu = p.to_device(tch::Device::Cpu).contiguous().reshape([-1]);
+    let host: Vec<f32> = Vec::try_from(&cpu).unwrap_or_default();
+    let row = p.size()[2] as usize;
+    let n = p.size()[1] as usize;
+    let base_cols = box_w + 2;
+    let extra_n = row.saturating_sub(base_cols);
+    let mut out = Vec::with_capacity(b as usize);
+    for bi in 0..b as usize {
+        let base = bi * n * row;
+        let mut dets: Vec<Det> = Vec::with_capacity(n.min(cfg.max_det));
+        let mut kept_extra: Vec<Vec<f32>> = Vec::new();
+        for ai in 0..n {
+            let rb = base + ai * row;
+            let sc = host[rb + box_w];
+            if (sc as f64) < cfg.conf {
+                continue;
+            }
+            dets.push(Det {
+                xyxy: [host[rb], host[rb + 1], host[rb + 2], host[rb + 3]],
+                score: sc,
+                cls: host[rb + box_w + 1].round() as i64,
+            });
+            if extra_n > 0 {
+                kept_extra.push(host[rb + base_cols..rb + base_cols + extra_n].to_vec());
+            }
+        }
+        if dets.len() > cfg.max_det {
+            dets.truncate(cfg.max_det);
+            kept_extra.truncate(cfg.max_det);
+        }
+        out.push(DetImage { dets, extra: kept_extra, extra_ch: extra_n });
+    }
+    out
+}

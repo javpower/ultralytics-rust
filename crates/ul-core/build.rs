@@ -6,7 +6,7 @@ use std::path::Path;
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let cfg_dir = Path::new(&manifest).join("../../ultralytics/cfg");
+    let cfg_dir = Path::new(&manifest).join("ultralytics/cfg");
     println!("cargo:rerun-if-changed={}", cfg_dir.display());
 
     let mut entries: Vec<(String, String)> = Vec::new();
@@ -23,7 +23,7 @@ fn main() {
                  let mut m = HashMap::new();\n",
     );
     for (rel, _path) in &entries {
-        code.push_str(&format!("        m.insert({rel:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../ultralytics/cfg/{rel}\")));\n", rel = rel));
+        code.push_str(&format!("        m.insert({rel:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/ultralytics/cfg/{rel}\")));\n", rel = rel));
     }
     code.push_str("                m\n            })\n        }\n\n");
     code.push_str(

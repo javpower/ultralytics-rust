@@ -1,10 +1,17 @@
 [package]
-name = "ul-engine"
+name = "ultralytics-rust-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "ul_engine"
 
 [dependencies]
 ul-core = { workspace = true }

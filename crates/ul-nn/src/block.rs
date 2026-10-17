@@ -233,7 +233,9 @@ impl C3k2 {
         for i in 0..n {
             let pi = mp.idx(i as usize);
             let blk = if attn {
-                let b = Bottleneck::init(&pi.child("0"), c_, c_, shortcut, g, (3, 3), 1.0);
+                // 官方 C3k2 attn 分支：Sequential(Bottleneck(self.c, self.c, shortcut, g),  ← e 用默认 0.5
+                //   PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)))
+                let b = Bottleneck::init(&pi.child("0"), c_, c_, shortcut, g, (3, 3), 0.5);
                 let psa = PsaBlock::init(&pi.child("1"), c_, 0.5, (c_ / 64).max(1));
                 InnerBlock::BottleneckPsa(b, psa)
             } else if c3k {
@@ -669,7 +671,7 @@ impl C2fCib {
         };
         let mp = p.child("m");
         for i in 0..n {
-            out.base.m.push(InnerBlock::Cib(Cib::init(&mp.idx(i as usize), c_, c_, shortcut, 1.0, lk)));
+            out.base.m.push(InnerBlock::Cib(Cib::init(&mp.idx(i as usize).child("cv1"), c_, c_, shortcut, 1.0, lk)));
         }
         out
     }

@@ -115,6 +115,7 @@ pub struct DetectHead {
     pub reg_max: i64,
     pub no: i64,
     pub legacy: bool,
+    pub light_cls: bool,
     pub end2end: bool,
     pub xyxy: bool,
     pub max_det: i64,
@@ -195,18 +196,18 @@ impl DetectHead {
             let cv2p = p.child("cv2").idx(i as usize);
             let cv3p = p.child("cv3").idx(i as usize);
             cv2.push(Branch::init(&cv2p, x, c2, reg_max * 4, true));
-            let c3i = if light_cls { x } else { c3 };
+            // v10 轻量 cls（官方 v10Detect：c3 对所有分支统一，Conv(x→c3)）
             cv3.push(if light_cls {
-                // v10 轻量 cls：Sequential((Conv g=x 3x3, Conv 1x1), (Conv g=c3, Conv 1x1), 1x1)
+                // Sequential((Conv g=x 3x3, Conv x→c3 1x1), (Conv g=c3 3x3, Conv 1x1), 1x1→nc)
                 let s0 = BranchStage::Pair(
                     Conv::init(&cv3p.idx(0).idx(0), x, x, 3, 1, None, x, 1, true),
-                    Conv::init(&cv3p.idx(0).idx(1), x, c3i, 1, 1, None, 1, 1, true),
+                    Conv::init(&cv3p.idx(0).idx(1), x, c3, 1, 1, None, 1, 1, true),
                 );
                 let s1 = BranchStage::Pair(
-                    Conv::init(&cv3p.idx(1).idx(0), c3i, c3i, 3, 1, None, c3i, 1, true),
-                    Conv::init(&cv3p.idx(1).idx(1), c3i, c3i, 1, 1, None, 1, 1, true),
+                    Conv::init(&cv3p.idx(1).idx(0), c3, c3, 3, 1, None, c3, 1, true),
+                    Conv::init(&cv3p.idx(1).idx(1), c3, c3, 1, 1, None, 1, 1, true),
                 );
-                Branch { stage0: s0, stage1: s1, final_conv: RawOut::init(&cv3p.idx(2), c3i, nc) }
+                Branch { stage0: s0, stage1: s1, final_conv: RawOut::init(&cv3p.idx(2), c3, nc) }
             } else {
                 Branch::init(&cv3p, x, c3, nc, legacy)
             });
@@ -259,6 +260,7 @@ impl DetectHead {
             reg_max,
             no: nc + reg_max * 4,
             legacy,
+            light_cls,
             end2end,
             xyxy: false,
             max_det: 300,
@@ -300,7 +302,19 @@ impl DetectHead {
             let cv2p = p.child("one2one_cv2").idx(i as usize);
             let cv3p = p.child("one2one_cv3").idx(i as usize);
             cv2.push(Branch::init(&cv2p, x, c2, self.reg_max * 4, true));
-            cv3.push(Branch::init(&cv3p, x, c3, self.nc, self.legacy));
+            if self.light_cls {
+                let s0 = BranchStage::Pair(
+                    Conv::init(&cv3p.idx(0).idx(0), x, x, 3, 1, None, x, 1, true),
+                    Conv::init(&cv3p.idx(0).idx(1), x, c3, 1, 1, None, 1, 1, true),
+                );
+                let s1 = BranchStage::Pair(
+                    Conv::init(&cv3p.idx(1).idx(0), c3, c3, 3, 1, None, c3, 1, true),
+                    Conv::init(&cv3p.idx(1).idx(1), c3, c3, 1, 1, None, 1, 1, true),
+                );
+                cv3.push(Branch { stage0: s0, stage1: s1, final_conv: RawOut::init(&cv3p.idx(2), c3, self.nc) });
+            } else {
+                cv3.push(Branch::init(&cv3p, x, c3, self.nc, self.legacy));
+            }
             match self.kind {
                 ExtraKind::None => {}
                 ExtraKind::Mask => {
@@ -512,7 +526,9 @@ impl DetectHead {
                 train,
             );
             if !train {
-                let y = self.inference_decode(&o2o);
+                // UL_INF_O2M=1：调试开关——用 one2many 分支走 E2E 后处理（定位 o2o 专属问题）
+                let src = if std::env::var("UL_INF_O2M").is_ok() { &o2m } else { &o2o };
+                let y = self.inference_decode(src);
                 return HeadOutput::Inference(self.postprocess_e2e(&y));
             }
             return HeadOutput::TrainDual(Box::new(o2m), Box::new(o2o));
@@ -591,11 +607,12 @@ impl DetectHead {
 
     /// e2e 后处理：topk(max_det) → (B, max_det, 6+extra)。
     fn postprocess_e2e(&self, preds: &Tensor) -> Tensor {
-        // preds (B, 4+nc+extra, A) → (B, A, 4+nc+extra)
+        // preds (B, bw+nc+extra, A) → (B, A, bw+nc+extra)；bw=4（detect/pose）或 5（obb xywhr）
+        let box_w = if self.kind == ExtraKind::Angle || self.kind == ExtraKind::Angle26 { 5 } else { 4 };
         let p = preds.transpose(1, 2);
         let total = p.size()[2];
-        let extra_n = total - 4 - self.nc;
-        let parts = p.split_with_sizes(&[4, self.nc, extra_n.max(0)], 2);
+        let extra_n = total - box_w - self.nc;
+        let parts = p.split_with_sizes(&[box_w, self.nc, extra_n.max(0)], 2);
         let boxes = &parts[0];
         let scores_raw = &parts[1];
         let extra = if extra_n > 0 { Some(&parts[2]) } else { None };
@@ -610,8 +627,8 @@ impl DetectHead {
         // idx0 行 = idx1 // nc
         let anchor_idx = idx0.gather(1, &idx1.floor_divide_scalar(self.nc), false);
         let q = idx1.floor_divide_scalar(self.nc);
-        let labels = ((&idx1 - &q) * self.nc).to_kind(Kind::Float).unsqueeze(2);
-        let gboxes = boxes.gather(1, &anchor_idx.unsqueeze(2).expand([-1, -1, 4], true), false);
+        let labels = (&idx1 - &q * self.nc).to_kind(Kind::Float).unsqueeze(2);
+        let gboxes = boxes.gather(1, &anchor_idx.unsqueeze(2).expand([-1, -1, box_w], true), false);
         let out = match extra {
             Some(e) => {
                 let ge = e.gather(1, &anchor_idx.unsqueeze(2).expand([-1, -1, e.size()[2]], true), false);
@@ -635,7 +652,8 @@ pub struct ClassifyHead {
 impl ClassifyHead {
     pub fn init(p: &VarPath, c1: i64, c2: i64) -> Self {
         let (weight, bias) = p.var_linear("linear.weight", c2, 1280);
-        ClassifyHead { conv: Conv::init(p, c1, 1280, 1, 1, None, 1, 1, true), weight, bias }
+        // 官方 Classify：self.conv = Conv(c1, 1280)（属性名 conv → 状态路径 conv.conv/conv.bn）
+        ClassifyHead { conv: Conv::init(&p.child("conv"), c1, 1280, 1, 1, None, 1, 1, true), weight, bias }
     }
 
     pub fn forward(&self, x: &Tensor, train: bool) -> (Tensor, Tensor) {

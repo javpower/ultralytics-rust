@@ -71,7 +71,7 @@ fn setup(task: &str, model_name: &str) -> Ref {
     let nc = v["nc"].as_i64();
     let mut m = YoloModel::build(model_name, nc, Device::Cpu, false).unwrap();
     ul_nn::pt::load_state_dict_into(&m.vs, &sd, false).unwrap();
-    let assigner = TaskAlignedAssigner { topk: 10, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    let assigner = TaskAlignedAssigner { topk: 10, topk2: 10, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
     Ref { v, img, labels, b, s, model: m, assigner }
 }
 
@@ -105,8 +105,8 @@ fn seg_loss_matches_official() {
         ModelOutput::Detect(h) => h,
         _ => panic!("expect detect head"),
     };
-    let assigner_o2o = TaskAlignedAssigner { topk: 1, ..TaskAlignedAssigner { topk: 10, num_classes: r.model.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 } };
-    let det = v8_detection_loss(&r.model, LossW::default(), &r.assigner, &assigner_o2o, &head, &batch, false);
+    let assigner_o2o = TaskAlignedAssigner { topk: 1, topk2: 1, ..TaskAlignedAssigner { topk: 10, topk2: 10, num_classes: r.model.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 } };
+    let det = v8_detection_loss(&r.model, LossW::default(), &r.assigner, &assigner_o2o, &head, &batch, false, 1.0, 0.0);
     let info = det.assign.as_ref().unwrap();
     let (rp, proto) = match &head {
         ul_nn::head::HeadOutput::Train(rp) => (rp, rp.proto.as_ref().expect("seg proto")),
@@ -152,8 +152,8 @@ fn pose_loss_matches_official() {
         ModelOutput::Detect(h) => h,
         _ => panic!("expect detect head"),
     };
-    let assigner_o2o = TaskAlignedAssigner { topk: 1, num_classes: r.model.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
-    let det = v8_detection_loss(&r.model, LossW::default(), &r.assigner, &assigner_o2o, &head, &batch, false);
+    let assigner_o2o = TaskAlignedAssigner { topk: 1, topk2: 1, num_classes: r.model.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    let det = v8_detection_loss(&r.model, LossW::default(), &r.assigner, &assigner_o2o, &head, &batch, false, 1.0, 0.0);
     let rp = match &head {
         ul_nn::head::HeadOutput::Train(rp) => rp,
         _ => panic!("expect train head"),

@@ -10,3 +10,6 @@ scripts/env.local.sh
 target-fresh/
 data/
 runs/
+bench_img/
+dist/
+deliver/

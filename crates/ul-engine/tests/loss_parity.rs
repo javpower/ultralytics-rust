@@ -61,9 +61,9 @@ fn loss_components_match_official() {
         ModelOutput::Detect(h) => h,
         _ => panic!("expect detect head output"),
     };
-    let assigner = TaskAlignedAssigner { topk: 10, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
-    let assigner_o2o = TaskAlignedAssigner { topk: 1, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
-    let det = v8_detection_loss(&m, LossW::default(), &assigner, &assigner_o2o, &head, &batch, false);
+    let assigner = TaskAlignedAssigner { topk: 10, topk2: 10, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    let assigner_o2o = TaskAlignedAssigner { topk: 1, topk2: 1, num_classes: m.nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    let det = v8_detection_loss(&m, LossW::default(), &assigner, &assigner_o2o, &head, &batch, false, 1.0, 0.0);
 
     let (rk, rc, rd) = (
         v["loss"]["box_loss"].as_f64().unwrap(),

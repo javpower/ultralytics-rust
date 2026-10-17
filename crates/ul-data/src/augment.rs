@@ -95,8 +95,8 @@ pub struct Augmentor {
     pub imgsz: u32,
     pub epoch: usize,
     pub dataset_len: usize,
-    /// 邻居取样回调（mosaic 用）。
-    pub neighbor: Box<dyn Fn(usize, &mut dyn FnMut(usize)) + Sync>,
+    /// 邻居取样回调（mosaic 用）。Send+Sync：训练预取线程需跨线程持有。
+    pub neighbor: Box<dyn Fn(usize, &mut dyn FnMut(usize)) + Send + Sync>,
 }
 
 impl Augmentor {

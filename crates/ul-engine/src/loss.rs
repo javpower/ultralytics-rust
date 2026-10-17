@@ -113,6 +113,8 @@ pub fn v8_detection_loss(
     out: &HeadOutput,
     batch: &DetBatch,
     e2e: bool,
+    o2m_gain: f64,
+    o2o_gain: f64,
 ) -> DetLoss {
     let bs = batch.batch_size as f64;
     let (o2m, o2o) = match out {
@@ -123,14 +125,26 @@ pub fn v8_detection_loss(
     let feats = &o2m.feats;
     let (points, strides) = make_anchors(feats, &model.stride, 0.5);
 
-    let (mut loss, mut parts, assign) = detect_branch_loss(model, assigner, o2m, batch, &points, &strides, w);
-    if e2e {
-        if let Some(o2o) = o2o {
-            let (l, p, _a2) = detect_branch_loss(model, assigner_o2o, o2o, batch, &points, &strides, w);
-            loss = loss + l;
-            parts.add(&p);
+    let (loss, parts, assign) = {
+        let (l, p, a) = detect_branch_loss(model, assigner, o2m, batch, &points, &strides, w);
+        if e2e {
+            if let Some(o2o) = o2o {
+                // 官方 E2ELoss：total = o2m×gain + o2o×gain（0.8/0.2 起步、逐 epoch 退火），
+                // items 取 one2one 分支（此处 parts 同官方语义记 o2o 分支）
+                let (l2, p2, _a2) = detect_branch_loss(model, assigner_o2o, o2o, batch, &points, &strides, w);
+                let total = l * o2m_gain + l2 * o2o_gain;
+                let mut parts = p;
+                parts.box_ = p2.box_;
+                parts.cls = p2.cls;
+                parts.dfl = p2.dfl;
+                (total, parts, a)
+            } else {
+                (l, p, a)
+            }
+        } else {
+            (l, p, a)
         }
-    }
+    };
     DetLoss {
         total: loss * bs,
         // 官方 items 语义：分量不乘 batch_size
@@ -160,11 +174,19 @@ pub fn detect_branch_loss(
 
     // 目标
     let (gt_labels, gt_bboxes, mask_gt) = prepare_targets(batch);
+    let trace = std::env::var("UL_TAL_TRACE").is_ok();
+    if trace { eprintln!("[loss] targets ok m={}", gt_bboxes.size()[1]); }
 
     // 官方语义：锚点与预测框均以像素坐标参与分配
     let anc_pixels = &points2 * &strides2; // (2, A)
     let scores_t = preds.scores.sigmoid().transpose(1, 2); // (B, A, nc)
-    let out = assigner.assign(&scores_t, &pd_pixels.transpose(1, 2), &anc_pixels, &gt_labels, &gt_bboxes, &mask_gt);
+    // 官方语义：锚点与预测框均以像素坐标参与分配。
+    // 官方 TaskAlignedAssigner.forward 带 @torch.no_grad()——目标为常数，
+    // 梯度不得流过分配图（CIoU/atan/pow^6 链既偏离官方又是不稳定源）
+    let out = tch::no_grad(|| {
+        assigner.assign(&scores_t, &pd_pixels.transpose(1, 2), &anc_pixels, &gt_labels, &gt_bboxes, &mask_gt)
+    });
+    if trace { eprintln!("[loss] assign ok"); }
     let assign_info = AssignInfo {
         fg_mask: out.fg_mask.shallow_clone(),
         target_gt_idx: out.target_gt_idx.shallow_clone(),
@@ -221,16 +243,40 @@ pub fn detect_branch_loss(
     let dfl_term = match dfl_apply_model(model, &preds.boxes, &fg_mask, &t_grid, points, &weight) {
         Some(d) => d / target_scores_sum.shallow_clone() * w.dfl,
         None => {
-            l1_reg1(&raw_boxes, &fg_mask, &t_grid, points, &stride_pa, &weight, batch.imgsz as f64)
+            if trace { eprintln!("[loss] l1_reg1 enter A={}", raw_boxes.size()[2]); }
+            let r = l1_reg1(&raw_boxes, &fg_mask, &t_grid, points, &stride_pa, &weight, batch.imgsz as f64)
                 / target_scores_sum.shallow_clone()
-                * w.dfl
+                * w.dfl;
+            if trace { eprintln!("[loss] l1_reg1 ok"); }
+            r
         }
     };
+    if trace { eprintln!("[loss] branch done"); }
 
     // 数值安全：各分量截到 ≥ 0（退化框时 CIoU 罚项可能越界）
     let cls_final = cls_loss.clamp_min(0.0);
     let iou_final = iou_loss.clamp_min(0.0);
     let dfl_final = dfl_term.clamp_min(0.0);
+    // 三分量一次 sync 取回（逐个 f64::try_from 会强制 3 次 GPU 同步/分支，
+    // 1280 下每迭代 6 次队列排空是主要额外开销）
+    let parts_v: Vec<f32> = Vec::try_from(
+        &Tensor::stack(&[&cls_final, &iou_final, &dfl_final], 0)
+            .to_kind(Kind::Float)
+            .to_device(tch::Device::Cpu),
+    )
+    .unwrap_or_default();
+    let parts = LossParts {
+        box_: parts_v.get(1).copied().unwrap_or(f32::NAN) as f64,
+        cls: parts_v.get(0).copied().unwrap_or(f32::NAN) as f64,
+        dfl: parts_v.get(2).copied().unwrap_or(f32::NAN) as f64,
+        ..Default::default()
+    };
+    if trace {
+        eprintln!("[lossval] cls={:.4} box={:.4} dfl={:.4} tss={:.2} nfg_w={:.3}",
+            parts.cls, parts.box_, parts.dfl,
+            f64::try_from(&target_scores_sum).unwrap_or(f64::NAN),
+            f64::try_from(&weight.sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN));
+    }
 
     let parts = LossParts {
         box_: f64::try_from(&iou_final).unwrap_or(f64::NAN),
@@ -266,8 +312,12 @@ fn l1_reg1(
     let b = t.select(1, 3).unsqueeze(1) - ay;
     let target_ltrb = Tensor::cat(&[l, t_, r, b], 1); // (N, 4)
 
-    // 每 fg 锚的 stride（格 → 像素）
-    let st = select_fg(&stride_pa.reshape([1, a, 1]), fg_mask); // (N, 1)
+    // 每 fg 锚的 stride（格 → 像素）。stride 逐图共享：必须先扩到 (B, A, 1)，
+    // 否则 fg 展平索引（第 2 图起 ≥A）对 (A,1) 的行数越界（仅 yolo26 的 reg_max=1 路径走到这里）
+    let st = select_fg(
+        &stride_pa.reshape([1, a, 1]).expand([fg_mask.size()[0], a, 1], true),
+        fg_mask,
+    ); // (N, 1)
     let target_px = &target_ltrb * &st;
     let pred_px = select_fg(&raw_boxes.transpose(1, 2), fg_mask) * &st; // (N, 4)
     // 归一化：x 分量 (l, r) 除宽，y 分量 (t, b) 除高
@@ -276,9 +326,34 @@ fn l1_reg1(
         Tensor::cat(&[&p[0] / imgsz, &p[1] / imgsz, &p[2] / imgsz, &p[3] / imgsz], 1)
     };
     let (tn, pn) = (norm(&target_px), norm(&pred_px));
-    let l1 = (pn - tn)
+    if std::env::var("UL_L1_DUMP").is_ok() {
+        let pvc = pn.to_device(tch::Device::Cpu).contiguous().reshape([-1]);
+        let tvc = tn.to_device(tch::Device::Cpu).contiguous().reshape([-1]);
+        let pv = Vec::<f32>::try_from(&pvc).unwrap_or_default();
+        let tv = Vec::<f32>::try_from(&tvc).unwrap_or_default();
+        eprintln!("[l1row] n={}", pv.len());
+        for i in 0..pv.len() / 4 {
+            eprintln!("[l1row] i={i} pn={:?} tn={:?}", &pv[i * 4..i * 4 + 4], &tv[i * 4..i * 4 + 4]);
+        }
+    }
+    if std::env::var("UL_TAL_TRACE").is_ok() {
+        let m = |t: &Tensor| f64::try_from(&t.abs().mean_dim(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN);
+        eprintln!("[l1] n={} |tn|={:.5} |pn|={:.5} target_mean={:.4} st_mean={:.2}",
+            t.size()[0], m(&tn), m(&pn),
+            f64::try_from(&t.abs().mean_dim(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN),
+            f64::try_from(&st.mean_dim(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN));
+    }
+    let l1 = (&pn - &tn)
         .abs()
         .mean_dim(Some(&[1i64][..]), true, Kind::Float); // (N, 1)
+    let _ = (&pn, &tn);
+    if std::env::var("UL_L1_DUMP").is_ok() {
+        let wm = f64::try_from(&weight.mean_dim(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN);
+        let ws = f64::try_from(&weight.sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN);
+        let dm = f64::try_from(&(pn - tn).abs().mean_dim(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN);
+        let total = f64::try_from(&(&l1 * weight).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN);
+        eprintln!("[l1sum] delta_mean={dm:.5} weight_mean={wm:.5} weight_sum={ws:.5} sum_l1w={total:.5}");
+    }
     (l1 * weight).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)
 }
 
@@ -464,7 +539,7 @@ pub fn segmentation_mask_loss(
 ) -> Tensor {
     let (bs, nm, mh, mw) = (proto.size()[0], proto.size()[1], proto.size()[2], proto.size()[3]);
     let (gh, gw) = (gt_masks.size()[1], gt_masks.size()[2]);
-    let imgsz_f = Tensor::from_slice(&[imgsz as f32]);
+    let imgsz_f = Tensor::from_slice(&[imgsz as f32]).to_device(proto.device());
     let mut loss = proto.zeros_like().sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
     let mut total_fg = 0f64;
     for i in 0..bs {
@@ -506,7 +581,7 @@ pub fn segmentation_mask_loss(
         let gt = (mrow.unsqueeze(0) - &one.unsqueeze(1)).abs().lt(1e-3).to_kind(Kind::Float); // (nf, gh*gw)
         // bbox 裁剪 + 面积（官方：归一化 xyxy → 掩码分辨率）
         let bb = info.target_bboxes.get(i).index_select(0, &nz); // (nf, 4) xyxy 像素
-        let sc = Tensor::from_slice(&[gw as f32, gh as f32, gw as f32, gh as f32]);
+        let sc = Tensor::from_slice(&[gw as f32, gh as f32, gw as f32, gh as f32]).to_device(proto.device());
         let mxyxy = &bb / &sc; // 归一化
         let mxyxy = &mxyxy * &sc;
         let (x1, y1, x2, y2) = (
@@ -551,7 +626,7 @@ pub fn segmentation_mask_loss(
         let per_area = per.unsqueeze(1) / &area;
         loss = &loss + per_area.sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
     }
-    let fg_t = Tensor::from_slice(&[total_fg as f32]);
+    let fg_t = Tensor::from_slice(&[total_fg as f32]).to_device(proto.device());
     loss / &fg_t
 }
 
@@ -595,6 +670,12 @@ pub fn pose_keypoints_loss(
         let nz = fg.nonzero().squeeze_dim(1);
         let mask_idx = info.target_gt_idx.get(i).index_select(0, &nz); // (nf_i,)
         let rows = batch_idx.eq(i).to_kind(Kind::Int64).nonzero().squeeze_dim(1); // (n_i,)
+        if std::env::var("UL_POSE_TRACE").is_ok() {
+            let mi = Vec::<i64>::try_from(&mask_idx.to_device(tch::Device::Cpu)).unwrap_or_default();
+            let gk = f64::try_from(&gt_kpts.abs().mean_dim(None::<&[i64]>, false, Kind::Float)).unwrap_or(f64::NAN);
+            eprintln!("[pose] i={} nfg={} rows={} mask_idx_min={:?} mask_idx_max={:?} gt_kpts_rows={} gt_kpts_absmean={gk:.4}",
+                i, nfg, rows.size()[0], mi.iter().min(), mi.iter().max(), gt_kpts.size()[0]);
+        }
         let sel_rows = rows.index_select(0, &mask_idx); // (nf_i,)
         let krow = gt_kpts.index_select(0, &sel_rows).to_kind(Kind::Float).reshape([sel_rows.size()[0], k, kpt_dim]);
         let st = info
@@ -602,7 +683,7 @@ pub fn pose_keypoints_loss(
             .transpose(0, 1)
             .reshape([1, a, 1])
             .index_select(1, &nz); // (1, nf, 1)
-        let sz_t = Tensor::from_slice(&[imgsz as f32]);
+        let sz_t = Tensor::from_slice(&[imgsz as f32]).to_device(gt_kpts.device());
         let mut gxy = krow.narrow(2, 0, 2) * &sz_t; // (nf,K,2) 像素
         gxy = &gxy / st.reshape([st.size()[1], 1, 1]); // 格单位
         let gv = if kpt_dim == 3 { Some(krow.narrow(2, 2, 1).shallow_clone()) } else { None };
@@ -614,7 +695,7 @@ pub fn pose_keypoints_loss(
         let d = (pk.narrow(2, 0, 1) - gxy.narrow(2, 0, 1)).pow_tensor_scalar(2.0)
             + (pk.narrow(2, 1, 1) - gxy.narrow(2, 1, 1)).pow_tensor_scalar(2.0);
         let sig = oks_sigmas(ku);
-        let sig_t = Tensor::from_slice(&sig.iter().map(|x| *x as f32).collect::<Vec<_>>()).reshape([1, k]);
+        let sig_t = Tensor::from_slice(&sig.iter().map(|x| *x as f32).collect::<Vec<_>>()).to_device(gt_kpts.device()).reshape([1, k]);
         let ar = (area.shallow_clone() + 1e-9).reshape([area.size()[0], 1]);
         let d2: Tensor = d.reshape([d.size()[0], k]); // (nf, K)
         let sig2: Tensor = (sig_t * 2.0).pow_tensor_scalar(2.0);
@@ -646,7 +727,7 @@ pub fn pose_keypoints_loss(
         kpt_sum = &kpt_sum + pred_kpts_raw.narrow(1, 0, 0).sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
         return (kpt_sum, kobj_sum);
     }
-    let cnt = Tensor::from_slice(&[total_fg as f32 * k as f32]);
+    let cnt = Tensor::from_slice(&[total_fg as f32 * k as f32]).to_device(gt_kpts.device());
     (kpt_sum / &cnt, kobj_sum / &cnt)
 }
 
@@ -689,14 +770,17 @@ pub fn obb_branch_loss(
             scores_t.size(), assign_in.transpose(1, 2).size(), anc_pixels.size(),
             gt_labels.size(), gt_xywhr_px.size(), mask_gt.size());
     }
-    let out = assigner.assign_rotated(
-        &scores_t,
-        &assign_in.transpose(1, 2),
-        &anc_pixels,
-        &gt_labels,
-        &gt_xywhr_px,
-        &mask_gt,
-    );
+    // 同 detect：官方分配器 no_grad，目标为常数
+    let out = tch::no_grad(|| {
+        assigner.assign_rotated(
+            &scores_t,
+            &assign_in.transpose(1, 2),
+            &anc_pixels,
+            &gt_labels,
+            &gt_xywhr_px,
+            &mask_gt,
+        )
+    });
     if std::env::var("UL_LOSS_DEBUG").is_ok() {
         eprintln!("[obb] assign ok fg={} tb={:?}", 
             f64::try_from(&out.fg_mask.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0),
@@ -739,26 +823,66 @@ pub fn obb_branch_loss(
     let iou_term: Tensor = (1.0 - &iou) * &weight;
     let iou_loss = iou_term.sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / tss.shallow_clone() * w.box_gain;
 
-    // DFL：rbox2dist 目标
+    // DFL（reg_max>1：rbox2dist 量化 CE）或旋转 L1（reg_max<=1，官方 RotatedBboxLoss else 分支）。
+    // reg_max=1 时 rbox2dist 的 clamp(0, -0.01) 会把目标全变负 → pos1=-1 → gather 越界（曾致 OBB 训练崩溃）
     let reg_max = match model.layers.last().map(|l| &l.module) {
         Some(ul_nn::parse::Module::Head(ul_nn::parse::HeadMod::Detect(dh))) => dh.reg_max,
         _ => 16,
     };
     let n = p_fg.size()[0];
-    let pd = pred_dist_rows(&preds.boxes, &fg_mask); // (N,4,rm)
-    let anc_fg = select_fg_points(&points2, &fg_mask); // (N,2)
-    let t_xywh = t_fg.narrow(1, 0, 4); // (N,4) 格 xywh
-    let t_ang = t_fg.narrow(1, 4, 1); // (N,1)
-    let ltrb = rbox2dist(&t_xywh, &anc_fg.transpose(0, 1), &t_ang, reg_max);
-    let pos1 = ltrb.to_kind(Kind::Int64);
-    let pos2 = &pos1 + 1;
-    let w1 = &pos2.to_kind(Kind::Float) - &ltrb;
-    let w2 = 1.0 - &w1;
-    let rm = pd.size()[2];
-    let ce1 = cross_entropy(&pd.reshape([n * 4, rm]), &pos1.reshape([-1])).reshape([n, 4]);
-    let ce2 = cross_entropy(&pd.reshape([n * 4, rm]), &pos2.reshape([-1])).reshape([n, 4]);
-    let dfl = ((&ce1 * w1 + &ce2 * w2) as Tensor).mean_dim(Some(&[1i64][..]), true, Kind::Float);
-    let dfl_term = (dfl * &weight).sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / tss.shallow_clone() * w.dfl;
+    let dfl_term = if reg_max > 1 {
+        let pd = pred_dist_rows(&preds.boxes, &fg_mask); // (N,4,rm)
+        let anc_fg = select_fg_points(&points2, &fg_mask); // (N,2)
+        let t_xywh = t_fg.narrow(1, 0, 4); // (N,4) 格 xywh
+        let t_ang = t_fg.narrow(1, 4, 1); // (N,1)
+        let ltrb = rbox2dist(&t_xywh, &anc_fg.transpose(0, 1), &t_ang, reg_max);
+        let pos1 = ltrb.to_kind(Kind::Int64);
+        let pos2 = &pos1 + 1;
+        let w1 = &pos2.to_kind(Kind::Float) - &ltrb;
+        let w2 = 1.0 - &w1;
+        let rm = pd.size()[2];
+        let ce1 = cross_entropy(&pd.reshape([n * 4, rm]), &pos1.reshape([-1])).reshape([n, 4]);
+        let ce2 = cross_entropy(&pd.reshape([n * 4, rm]), &pos2.reshape([-1])).reshape([n, 4]);
+        let dfl = ((&ce1 * w1 + &ce2 * w2) as Tensor).mean_dim(Some(&[1i64][..]), true, Kind::Float);
+        (dfl * &weight).sum_dim_intlist(None::<&[i64]>, false, Kind::Float) / tss.shallow_clone() * w.dfl
+    } else {
+        // 官方 RotatedBboxLoss L1 分支：rbox2dist（无 clamp，格单位）×stride → 像素，
+        // l,r ÷W、t,b ÷H（方形输入 W=H=imgsz），pred 同步归一，L1 mean ×weight → sum / tss × gain
+        let anc_fg = select_fg_points(&points2, &fg_mask); // (N,2) 格
+        let t_xywh = t_fg.narrow(1, 0, 4); // (N,4) 格 xywh
+        let t_ang = t_fg.narrow(1, 4, 1); // (N,1)
+        let xy = t_xywh.narrow(1, 0, 2);
+        let wh = t_xywh.narrow(1, 2, 2);
+        let offset = &xy - &anc_fg;
+        let off_x = offset.narrow(1, 0, 1);
+        let off_y = offset.narrow(1, 1, 1);
+        let cos = t_ang.cos();
+        let sin = t_ang.sin();
+        let xf = &off_x * &cos + &off_y * &sin;
+        let yf = -&off_x * &sin + &off_y * &cos;
+        let w_h = wh.narrow(1, 0, 1);
+        let h_h = wh.narrow(1, 1, 1);
+        let ltrb = Tensor::cat(&[&w_h / 2.0 - &xf, &h_h / 2.0 - &yf, &w_h / 2.0 + &xf, &h_h / 2.0 + &yf], 1); // (N,4) 格，无 clamp
+        let pd_ltrb = pred_dist_rows(&preds.boxes, &fg_mask).reshape([n, 4]); // (N,4) 格（reg_max=1 原始 ltrb）
+        let a_tot = strides2.size()[1];
+        let st = select_fg(
+            &strides2
+                .transpose(0, 1)
+                .reshape([1, a_tot, 1])
+                .expand([batch.batch_size, a_tot, 1], true),
+            &fg_mask,
+        ); // (N,1) 每 fg 锚 stride
+        let norm = |v: &Tensor| {
+            let c = v.split_with_sizes(&[1, 1, 1, 1], 1);
+            Tensor::cat(&[&c[0] / imgsz, &c[1] / imgsz, &c[2] / imgsz, &c[3] / imgsz], 1)
+        };
+        let tn = norm(&(ltrb * &st));
+        let pn = norm(&(pd_ltrb * &st));
+        ((pn - tn).abs().mean_dim(Some(&[1i64][..]), true, Kind::Float) * &weight)
+            .sum_dim_intlist(None::<&[i64]>, false, Kind::Float)
+            / tss.shallow_clone()
+            * w.dfl
+    };
 
     // 角度损失（官方 calculate_angle_loss，lambda=3）
     let w_gt = t_fg.narrow(1, 2, 1);
@@ -768,7 +892,7 @@ pub fn obb_branch_loss(
     let log_ar = ((w_gt + 1e-9) / (h_gt + 1e-9)).log();
     let scale_w = (-log_ar.pow_tensor_scalar(2.0) / 9.0).exp();
     let dth = p_th - t_th;
-    let pi_t = Tensor::from_slice(&[std::f32::consts::PI]);
+    let pi_t = Tensor::from_slice(&[std::f32::consts::PI]).to_device(p_fg.device());
     let dth_w = &dth - ((&dth / &pi_t).round() * &pi_t);
     // 官方：sin(2·Δθ_wrapped)²（注意角度先乘 2 再取 sin）
     let ang = (dth_w * 2.0).sin().pow_tensor_scalar(2.0) * &scale_w * &weight;

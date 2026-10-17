@@ -366,7 +366,7 @@ pub fn parse_dataset_yaml(path: &Path) -> Result<DatasetYaml, crate::UlError> {
 mod tests {
     use super::*;
 
-    const YOLO11: &str = include_str!("../../../ultralytics/cfg/models/11/yolo11.yaml");
+    const YOLO11: &str = include_str!("../ultralytics/cfg/models/11/yolo11.yaml");
 
     #[test]
     fn parse_yolo11() {

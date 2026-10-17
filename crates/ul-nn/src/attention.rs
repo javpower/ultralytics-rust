@@ -207,7 +207,8 @@ impl AAttn {
             all_head_dim,
             qkv: Conv::init(&p.child("qkv"), dim, all_head_dim * 3, 1, 1, None, 1, 1, false),
             proj: Conv::init(&p.child("proj"), all_head_dim, dim, 1, 1, None, 1, 1, false),
-            pe: dwconv_init(&p.child("pe"), all_head_dim, all_head_dim, 7, 1, 1, false),
+            // 官方 A2C2f PE：DW 7×7 内层 conv 带 bias（ckpt: pe.conv.{weight,bias} + pe.bn.*）
+            pe: crate::conv::dwconv_init_bias(&p.child("pe"), all_head_dim, all_head_dim, 7, 1, false),
         }
     }
 

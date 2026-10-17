@@ -11,6 +11,9 @@ use crate::ops::bbox_iou_pairwise;
 /// TAL 分配器。
 pub struct TaskAlignedAssigner {
     pub topk: i64,
+    /// 二次过滤 topk（官方 E2ELoss 的 one2one 分配器 topk=7/topk2=1）：
+    /// 多 gt 仲裁后按 align_metric×mask_pos 取前 topk2 锚，其余清零。<=topk 时关闭。
+    pub topk2: i64,
     pub num_classes: i64,
     pub alpha: f64,
     pub beta: f64,
@@ -21,7 +24,7 @@ pub struct TaskAlignedAssigner {
 
 impl Default for TaskAlignedAssigner {
     fn default() -> Self {
-        TaskAlignedAssigner { topk: 10, num_classes: 80, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 }
+        TaskAlignedAssigner { topk: 10, topk2: 10, num_classes: 80, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 }
     }
 }
 
@@ -83,6 +86,11 @@ impl TaskAlignedAssigner {
         let device = pd_bboxes.device();
         let gw = gt_bboxes.size()[2]; // 4 = xyxy / 5 = xywhr
 
+        if std::env::var("UL_TAL_TRACE").is_ok() {
+            eprintln!("[tal] assign enter bs={bs} A={na} m={m} pd_nc={} gt_shape={:?} mask_gt_shape={:?} anc={:?}",
+                pd_scores.size()[2], gt_bboxes.size(), mask_gt.size(), anc_points.size());
+        }
+
         if m == 0 {
             return AssignOut {
                 target_labels: Tensor::full([bs, na], self.num_classes as f64, (Kind::Int64, device)),
@@ -107,6 +115,7 @@ impl TaskAlignedAssigner {
         };
         let (mut align_metric, mut overlaps) =
             self.get_box_metrics_impl(pd_scores, pd_bboxes, gt_labels, gt_bboxes, &(mask_in_gts.to_kind(Kind::Bool) * mask_gt), rotated);
+        if std::env::var("UL_TAL_TRACE").is_ok() { eprintln!("[tal] 1 box_metrics ok"); }
 
         if std::env::var("UL_OBB_DEBUG").is_ok() && rotated {
             let f = |t: &Tensor| f64::try_from(&t.to_kind(Kind::Float).sum_dim_intlist(None::<&[i64]>, false, Kind::Float)).unwrap_or(0.0);
@@ -122,18 +131,22 @@ impl TaskAlignedAssigner {
         // 2) topk 候选（每 gt 取 align 最高的 topk 锚；重复命中置 0）
         let topk_mask = mask_gt.expand([bs, m, self.topk], true);
         let mask_topk = self.select_topk_candidates(&align_metric, Some(&topk_mask));
+        if std::env::var("UL_TAL_TRACE").is_ok() { eprintln!("[tal] 2 topk ok"); }
 
         // 3) 合并正样本掩码
         let mut mask_pos = mask_topk
             * mask_in_gts.to_kind(Kind::Float)
             * mask_gt.to_kind(Kind::Float);
 
-        // 4) 一锚多 gt 仲裁
-        let (fg_mask_f, target_gt_idx) = self.select_highest_overlaps(&mut mask_pos, &mut overlaps);
+        // 4) 一锚多 gt 仲裁（+ topk2 二次过滤）
+        let (fg_mask_f, target_gt_idx) =
+            self.select_highest_overlaps(&mut mask_pos, &mut overlaps, &align_metric);
+        if std::env::var("UL_TAL_TRACE").is_ok() { eprintln!("[tal] 3 overlaps ok"); }
 
         // 5) 目标
         let (target_labels, target_bboxes, target_scores) =
             self.get_targets(gt_labels, gt_bboxes, &target_gt_idx, &fg_mask_f, bs, m, device);
+        if std::env::var("UL_TAL_TRACE").is_ok() { eprintln!("[tal] 4 targets ok"); }
 
         // 6) 归一化（官方 parity）
         align_metric = align_metric * mask_pos.shallow_clone();
@@ -237,19 +250,26 @@ impl TaskAlignedAssigner {
         }
         // indices = mask.nonzero → (K, 3)
         let idx = mask.nonzero();
+        if std::env::var("UL_TAL_TRACE").is_ok() {
+            eprintln!("[tal] box_metrics K={} idx_shape={:?} mask_shape={:?} ps={:?} pd_bbox={:?}",
+                idx.size()[0], idx.size(), mask.size(), pd_scores.size(), pd_bboxes.size());
+        }
         let b_idx = idx.select(1, 0);
         let g_idx = idx.select(1, 1);
         let a_idx = idx.select(1, 2);
         // bbox_scores = pd_scores[b, a, gt_label]
+        // 逐三元组线性索引取值——官方 bbox_scores[mask] 语义。
+        // 严禁 index_select(0, b_idx) 整块物化 (K, nc, A)/(K, A, 4)：真实数据大框时
+        // K 上万（实测 52k），每分支 ~7GB 中间张量 ×2 分支 ×autograd 直接 OOM。
+        let na_ = pd_bboxes.size()[1];
+        let nc_ = pd_scores.size()[2];
         let lbl = gt_labels.select(2, 0).to_kind(Kind::Int64); // (bs, m)
-        let lbl_sel = lbl.index_select(0, &b_idx).index_select(1, &g_idx); // (K, 1) g_idx 是逐 K 的列选择——改为 gather
-        let _ = lbl_sel;
-        // 逐三元组取值：label = lbl[b, g]
-        let ps = pd_scores.permute([0, 2, 1]); // (bs, nc, A)
-        let lbl_k = batched_select2_i64(&lbl, &b_idx, &g_idx); // (K,)
-        let scores_sel = batched_select3(&ps, &b_idx, &lbl_k, &a_idx);
-        let gt_sel = batched_select2(gt_bboxes, &b_idx, &g_idx); // (K, 4)
-        let pd_sel = batched_select2(pd_bboxes, &b_idx, &a_idx); // (K, 4)
+        let bg = &b_idx * m + &g_idx; // (K,) (bs,m) 平面索引
+        let lbl_k = lbl.reshape([-1]).index_select(0, &bg); // (K,) = lbl[b,g]
+        let ps_flat = pd_scores.permute([0, 2, 1]).contiguous().reshape([-1]); // (bs*nc*A,)
+        let scores_sel = ps_flat.index_select(0, &(&(&b_idx * (nc_ * na_) + &lbl_k * na_) + &a_idx)); // (K,)
+        let gt_sel = gt_bboxes.reshape([-1, gt_bboxes.size()[2]]).index_select(0, &bg); // (K, 4) = gt[b,g]
+        let pd_sel = pd_bboxes.reshape([-1, pd_bboxes.size()[2]]).index_select(0, &(&b_idx * na_ + &a_idx)); // (K, 4) = pd[b,a]
         // 成对 IoU；官方 iou_calculation 末尾 clamp_(0)（负值在 ^β 下会翻正）
         let ov = if rotated {
             crate::ops::probiou_pairwise(&gt_sel, &pd_sel, false, 0.0).squeeze_dim(1).clamp_min(0.0)
@@ -295,8 +315,9 @@ impl TaskAlignedAssigner {
     }
 
     /// select_highest_overlaps（官方）：一锚多 gt → 保留重叠最大的 gt。
-    /// 全程 (bs, m, A)。返回 (fg (bs, A) float, idx (bs, A) i64)。
-    fn select_highest_overlaps(&self, mask_pos: &mut Tensor, overlaps: &mut Tensor) -> (Tensor, Tensor) {
+    /// 全程 (bs, m, A)。topk2≠topk 时按 align×mask_pos 二次过滤（官方 E2ELoss o2o 分支）。
+    /// 返回 (fg (bs, A) float, idx (bs, A) i64)。
+    fn select_highest_overlaps(&self, mask_pos: &mut Tensor, overlaps: &mut Tensor, align_metric: &Tensor) -> (Tensor, Tensor) {
         let (bs, m, a) = (mask_pos.size()[0], mask_pos.size()[1], mask_pos.size()[2]);
         let device = mask_pos.device();
         let fg_any = mask_pos.sum_dim_intlist(Some(&[1i64][..]), false, Kind::Float); // (bs, A)
@@ -313,6 +334,15 @@ impl TaskAlignedAssigner {
             let keep = mask_pos.shallow_clone() * (1.0 - mask_multi.to_kind(Kind::Float));
             let take = is_max * mask_multi.to_kind(Kind::Float);
             *mask_pos = take + keep;
+        }
+        // topk2 二次过滤（官方 select_highest_overlaps 的 topk2 分支）：沿锚点维取
+        // 每 gt 的前 topk2 锚——one2one 分配器 topk=7/topk2=1 时即唯一化
+        if self.topk2 != self.topk {
+            let align2 = align_metric * &*mask_pos;
+            let (_sv, tidx) = align2.topk(self.topk2, 2, true, true); // (bs, m, topk2) 值=锚索引
+            let ones = Tensor::ones([bs, m, self.topk2], (Kind::Float, device));
+            let topk_idx = Tensor::zeros([bs, m, a], (Kind::Float, device)).scatter(2, &tidx, &ones);
+            *mask_pos = &*mask_pos * &topk_idx;
         }
         let maxed = mask_pos.max_dim(1, false); // (values (bs,A), indices (bs,A))
         (maxed.0, maxed.1)

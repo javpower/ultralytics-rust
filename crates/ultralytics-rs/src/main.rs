@@ -19,7 +19,8 @@ struct Args {
     kvs: Vec<String>,
 }
 
-/// 模型路径解析：cwd → weights/ 目录（官方权重默认下载位置）。
+/// 模型路径解析：cwd → weights/ 目录（官方权重默认下载位置）；
+/// 裸 `*.pt` 名（如 yolo26n.pt）缺文件时自动从官方资产库下载。
 fn resolve_model_path(name: &str) -> PathBuf {
     let p = Path::new(name);
     if p.exists() {
@@ -29,7 +30,64 @@ fn resolve_model_path(name: &str) -> PathBuf {
     if alt.exists() {
         return alt;
     }
+    if is_bare_official_weight(name) {
+        let low = name.to_ascii_lowercase();
+        let dir = Path::new("weights");
+        let _ = std::fs::create_dir_all(dir);
+        let dst = dir.join(name);
+        // yolo26 系权重在 v8.4.0 release，其余在 v8.3.0；逐 tag 回退
+        let tags: [ &str; 2 ] = if low.starts_with("yolo26") { ["v8.4.0", "v8.3.0"] } else { ["v8.3.0", "v8.4.0"] };
+        for tag in tags {
+            let url = format!("https://github.com/ultralytics/assets/releases/download/{tag}/{name}");
+            println!("downloading official weights: {url}");
+            let _ = std::fs::remove_file(&dst);
+            if run_fetcher(&url, &dst) && valid_pt(&dst) {
+                println!("saved → {}", dst.display());
+                return dst;
+            }
+            let _ = std::fs::remove_file(&dst);
+        }
+        eprintln!("warning: download failed (网络受限可手动下载权重放入 weights/)");
+    }
     p.to_path_buf()
+}
+
+/// 完整性校验：ultralytics .pt 为 zip 容器，必须以 PK 魔数开头且非 404 文本。
+fn valid_pt(p: &Path) -> bool {
+    match std::fs::read(p) {
+        Ok(data) => data.len() > 1024 && data.starts_with(b"PK"),
+        Err(_) => false,
+    }
+}
+
+/// 官方资产库托管的权重名（yolo/yolov 前缀 + .pt）。
+fn is_bare_official_weight(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    (low.starts_with("yolo") || low.starts_with("yolov")) && low.ends_with(".pt") && !name.contains('/')
+}
+
+/// 下载器：优先系统 curl（Win10 1803+ 自带），回退 PowerShell。
+fn run_fetcher(url: &str, dst: &Path) -> bool {
+    let curl = std::process::Command::new("curl")
+        .args(["-sL", "--max-time", "600", "-o"])
+        .arg(dst)
+        .arg(url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if curl && dst.exists() {
+        return true;
+    }
+    let ps = format!(
+        "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '{}' -OutFile '{}'",
+        url,
+        dst.display()
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn parse_kvs(kvs: &[String]) -> std::collections::HashMap<String, String> {
@@ -66,8 +124,27 @@ fn find_cfg_path(name: &str) -> PathBuf {
     PathBuf::from(stem)
 }
 
+/// Windows/MSVC：MSVC 链接器不链接无符号引用的导入库，torch_cuda.dll 不会被加载、
+/// 其静态注册器不运行 → ATen dispatcher 无 CUDA 后端，cuda_if_available() 恒为
+/// false、静默回退 CPU。启动时强制加载一次（幂等）。
+#[cfg(windows)]
+fn ensure_torch_cuda_loaded() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut std::ffi::c_void;
+    }
+    let ok = unsafe { !LoadLibraryA(c"torch_cuda.dll".as_ptr().cast()).is_null() };
+    if !ok {
+        log::debug!("torch_cuda.dll 加载失败（CPU 版 libtorch 或无 GPU），按 CPU 处理");
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_torch_cuda_loaded() {}
+
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    ensure_torch_cuda_loaded();
     let args = Args::parse();
     let kv = parse_kvs(&args.kvs);
     let get = |k: &str| kv.get(k).cloned();
@@ -130,16 +207,18 @@ fn main() -> anyhow::Result<()> {
                 momentum: getf("momentum", 0.937),
                 weight_decay: getf("weight_decay", 0.0005),
                 warmup_epochs: getf("warmup_epochs", 3.0),
+                warmup_bias_lr: getf("warmup_bias_lr", 0.1),
                 optimizer: get("optimizer").unwrap_or_else(|| "auto".into()),
                 cos_lr: getb("cos_lr", false),
-                amp: getb("amp", false),
+                amp: getb("amp", true),
                 device,
                 seed: geti("seed", 0) as u64,
                 workers: geti("workers", 8) as usize,
                 augment,
                 nbs: geti("nbs", 16) as usize,
                 multi_scale: getb("multi_scale", false),
-                val_interval: 1,
+                cache_ram: getb("cache", false),
+                val_interval: geti("val_interval", 1) as usize,
                 project: PathBuf::from(get("project").unwrap_or_else(|| "runs".into())),
                 name: get("name").unwrap_or_else(|| "train".into()),
                 exist_ok: getb("exist_ok", false),
@@ -291,7 +370,12 @@ fn load_model_for_infer(model_name: &str, device: tch::Device) -> anyhow::Result
         let names_ckpt = extract_names(&meta);
         let nc = names_ckpt.as_ref().map(|n| n.len() as i64);
         let mut m = YoloModel::build(stem, nc, device, false)?;
-        ul_nn::pt::load_state_dict_into(&m.vs, &sd, false)?;
+        let rep = ul_nn::pt::load_state_dict_into(&m.vs, &sd, false);
+        match &rep {
+            Ok(r) => log::info!("load {model_name}: {} mismatch={:?} unexpected={:?}", r.summary(), r.shape_mismatch, r.unexpected),
+            Err(e) => log::warn!("load {model_name}: {e}"),
+        }
+        rep?;
         let nc = m.nc;
         m.names = names_ckpt.unwrap_or_else(|| (0..nc).map(|i| format!("class_{i}")).collect());
         let names = m.names.clone();

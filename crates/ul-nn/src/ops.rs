@@ -104,13 +104,21 @@ pub fn bbox_iou(box1: &Tensor, box2: &Tensor, giou: bool, diou: bool, ciou: bool
             let h1 = wh_a.select(2, 1).reshape([-1, 1]);
             let w2 = wh_b.select(2, 0).reshape([1, -1]);
             let h2 = wh_b.select(2, 1).reshape([1, -1]);
-            let v = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0)
+            let v = (atan_ratio(&w2, &h2).atan() - atan_ratio(&w1, &h1).atan()).pow_tensor_scalar(2.0)
                 * (4.0 / std::f64::consts::PI.powi(2));
             let alpha = &v / ((1 - &iou) + &v);
             iou = &iou - (&v * alpha);
         }
     }
     iou
+}
+
+/// atan(w/h)：w=h=0 时 0/0=NaN（reg_max=1 的 ltrb 可为负，预测框可塌缩到零宽高）——
+/// 退化情形按 atan(0)=0 处理；h=0 但 w≠0 时比值为 ±Inf、atan 仍有限，保持官方语义。
+pub fn atan_ratio(w: &Tensor, h: &Tensor) -> Tensor {
+    let r = w / h;
+    let ok = h.abs().gt(1e-12).logical_or(&w.abs().gt(1e-12));
+    r.where_self(&ok, &r.zeros_like())
 }
 
 /// 成对 IoU：box1 (N,4) vs box2 (N,4) → (N,1)（tal.py bbox_iou 语义）。
@@ -135,8 +143,8 @@ pub fn bbox_iou_pairwise(box1: &Tensor, box2: &Tensor, ciou: bool) -> Tensor {
         let d = b1 + b2 - a1 - a2;
         let rho2 = (d.select(1, 0) * d.select(1, 0) + d.select(1, 1) * d.select(1, 1)) / 4.0;
         iou = &iou - rho2 / c2;
-        let v = ((wh_b.select(1, 0) / wh_b.select(1, 1)).atan()
-            - (wh_a.select(1, 0) / wh_a.select(1, 1)).atan())
+        let v = (atan_ratio(&wh_b.select(1, 0), &wh_b.select(1, 1)).atan()
+            - atan_ratio(&wh_a.select(1, 0), &wh_a.select(1, 1)).atan())
         .pow_tensor_scalar(2.0)
             * (4.0 / std::f64::consts::PI.powi(2));
         let one_minus: tch::Tensor = 1.0 - &iou;
@@ -172,7 +180,7 @@ pub fn bbox_iou_ciou_batched(gt: &Tensor, pd: &Tensor, eps: f64) -> Tensor {
     let h1 = wh_a.select(3, 1).unsqueeze(2);
     let w2 = wh_b.select(3, 0).unsqueeze(1); // (bs, 1, A)
     let h2 = wh_b.select(3, 1).unsqueeze(1);
-    let v = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0) * (4.0 / std::f64::consts::PI.powi(2));
+    let v = (atan_ratio(&w2, &h2).atan() - atan_ratio(&w1, &h1).atan()).pow_tensor_scalar(2.0) * (4.0 / std::f64::consts::PI.powi(2));
     let alpha = &v / ((1 - &iou) + &v + eps);
     iou = &iou - (v * alpha);
     iou
@@ -249,7 +257,7 @@ pub fn probiou_pairwise(obb1: &Tensor, obb2: &Tensor, ciou: bool, floor: f64) ->
         let h1: Tensor = obb1.narrow(1, 3, 1);
         let w2: Tensor = obb2.narrow(1, 2, 1);
         let h2: Tensor = obb2.narrow(1, 3, 1);
-        let v: Tensor = ((w2 / h2).atan() - (w1 / h1).atan()).pow_tensor_scalar(2.0)
+        let v: Tensor = (atan_ratio(&w2, &h2).atan() - atan_ratio(&w1, &h1).atan()).pow_tensor_scalar(2.0)
             * (4.0 / std::f64::consts::PI.powi(2));
         let base: Tensor = v.pow_tensor_scalar(1.0) - &iou + (1.0 + eps);
         let alpha: Tensor = &v / &base;

@@ -164,6 +164,20 @@ impl Conv {
 }
 
 /// `DWConv`：depthwise（groups = gcd(c1,c2)，标准用法下 = c1）。
+/// DW conv 带 bias 的变体（官方 A2C2f PE：Conv2d(groups=c2, bias=True) + BN，k=7, pad=k/2）。
+pub fn dwconv_init_bias(p: &VarPath, c1: i64, c2: i64, k: i64, s: i64, act: bool) -> Conv {
+    let conv = RawConv::init(&p.child("conv"), c1, c2, k, true, c2);
+    let mut conv = conv;
+    conv.stride = s;
+    let pad = k / 2;
+    conv.pad_h = pad;
+    conv.pad_w = pad;
+    conv.padding = pad;
+    conv.dilation = 1;
+    let bn = BatchNorm::init(p, c2);
+    Conv { conv, bn, act }
+}
+
 pub fn dwconv_init(p: &VarPath, c1: i64, c2: i64, k: i64, s: i64, d: i64, act: bool) -> Conv {
     let g = gcd(c1, c2);
     Conv::init(p, c1, c2, k, s, None, g, d, act)

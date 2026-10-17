@@ -32,6 +32,10 @@ pub struct TrainCfg {
     pub momentum: f64,
     pub weight_decay: f64,
     pub warmup_epochs: f64,
+    /// 官方 default.yaml warmup_bias_lr=0.1；optimizer=auto 选定 AdamW 时官方强制置 0
+    /// （trainer.py: "no higher than 0.01 for Adam"——AdamW 的归一化更新会把
+    ///  预训练 bias/BN β 每步暴踢 ±0.1，第一步即摧毁预训练框对齐）。
+    pub warmup_bias_lr: f64,
     pub optimizer: String, // auto | SGD | AdamW
     pub cos_lr: bool,
     pub amp: bool,
@@ -44,6 +48,8 @@ pub struct TrainCfg {
     pub nbs: usize,
     /// multi-scale 训练（官方默认开）：每批随机 [0.5,1.5]×imgsz，32 对齐。
     pub multi_scale: bool,
+    /// cache="ram"：预解码 + 按 imgsz 预缩缓存到内存（官方 load_image 语义）。
+    pub cache_ram: bool,
     pub val_interval: usize,
     pub project: PathBuf,
     pub name: String,
@@ -63,6 +69,7 @@ impl Default for TrainCfg {
             momentum: 0.937,
             weight_decay: 0.0005,
             warmup_epochs: 3.0,
+            warmup_bias_lr: 0.1,
             optimizer: "auto".into(),
             cos_lr: false,
             amp: true,
@@ -72,6 +79,7 @@ impl Default for TrainCfg {
             augment: AugmentCfg::default(),
             nbs: 16,
             multi_scale: false,
+            cache_ram: false,
             val_interval: 1,
             project: PathBuf::from("runs"),
             name: "train".into(),
@@ -229,11 +237,16 @@ impl ManualOptimizer {
     }
 
     pub fn zero_grad(&self) {
+        // 清零的是梯度，不是参数！（历史 bug：set_data(zeros) 作用在参数上——
+        // 第一次 step 后模型即被清零，logits≡0、损失恒为 softplus(0) 常数）
         tch::no_grad(|| {
             for (_, t) in &self.vars {
-                let mut tm = t.shallow_clone();
-                let z = t.zeros_like();
-                let _ = tm.set_data(&z);
+                if let Ok(mut g) = t.f_grad() {
+                    if g.defined() {
+                        let z = g.zeros_like();
+                        let _ = g.set_data(&z);
+                    }
+                }
             }
         });
     }
@@ -292,6 +305,79 @@ pub struct TrainReport {
     pub epochs_done: usize,
 }
 
+/// 批构建：增强 + letterbox + 行组装（rayon 批内并行；可在线程中预取）。
+/// Augmentor 按 (epoch, index) 确定性播种，预取与同步结果逐位一致。
+#[allow(clippy::too_many_arguments)]
+fn build_train_batch<F>(
+    chunk: &[usize],
+    epoch: usize,
+    augmentor: &ul_data::augment::Augmentor,
+    load: &F,
+    bsz: u32,
+    classify_mode: bool,
+    ds_task: ul_data::dataset::TaskKind,
+    erasing: f64,
+) -> (Vec<Img>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<u8>>)
+where
+    F: Fn(usize) -> Option<ul_data::dataset::Sample> + Sync,
+{
+    use rayon::prelude::*;
+    let per: Vec<(Img, Vec<Vec<f32>>, Vec<Vec<f32>>, Option<Vec<u8>>)> = chunk
+        .par_iter()
+        .map(|&idx| {
+            let mut smp = augmentor.train_augment(idx, load);
+            // 官方 erasing 仅 classify 管线（default 0.4）；并行下按 (epoch, idx) 确定性播种
+            if classify_mode {
+                let mut er = ul_data::augment::Rng::rng_new(0x5EED_0000 ^ ((epoch as u64) << 32) ^ idx as u64);
+                let (a, b, c, d) = (er.f32(), er.f32(), er.f32(), er.f32());
+                ul_data::augment::random_erasing(&mut smp, erasing, a, b, c, d);
+            }
+            if smp.img.w != bsz || smp.img.h != bsz {
+                smp.img = letterbox(&smp.img, bsz, [114, 114, 114]);
+            }
+            let mut rows: Vec<Vec<f32>> = Vec::new();
+            let mut kpt: Vec<Vec<f32>> = Vec::new();
+            let mut mask: Option<Vec<u8>> = None;
+            for ins in &smp.instances {
+                if classify_mode {
+                    rows.push(vec![0.0f32, ins.cls as f32]);
+                    continue;
+                }
+                let mut row = vec![0f32, ins.cls as f32, ins.xywhn[0], ins.xywhn[1], ins.xywhn[2], ins.xywhn[3]];
+                if ds_task == ul_data::dataset::TaskKind::Obb {
+                    row.push(ins.angle);
+                }
+                rows.push(row);
+                if ds_task == ul_data::dataset::TaskKind::Pose {
+                    kpt.push(ins.kpts.clone());
+                }
+            }
+            if ds_task == ul_data::dataset::TaskKind::Segment {
+                mask = Some(ul_data::augment::rasterize_mask(&smp, bsz));
+            }
+            (smp.img, rows, kpt, mask)
+        })
+        .collect();
+    let mut imgs: Vec<Img> = Vec::with_capacity(chunk.len());
+    let mut labels: Vec<Vec<f32>> = Vec::new();
+    let mut kpts: Vec<Vec<f32>> = Vec::new();
+    let mut masks_v: Vec<Vec<u8>> = Vec::new();
+    for (bi, (img, rows, kpt, mask)) in per.into_iter().enumerate() {
+        imgs.push(img);
+        for mut row in rows {
+            row[0] = bi as f32;
+            labels.push(row);
+        }
+        for k in kpt {
+            kpts.push(k);
+        }
+        if let Some(m) = mask {
+            masks_v.push(m);
+        }
+    }
+    (imgs, labels, kpts, masks_v)
+}
+
 /// 训练入口（检测家族；分类/分割/姿态/旋转框按 task 分支见 validate/predict）。
 pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<TrainReport, UlError> {
     // classify：data 即目录布局根（root/<class>/<img>），不走 yaml
@@ -328,7 +414,7 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
         train_ds.img_files.extend(extra.img_files);
         train_ds.cache.extend(extra.cache);
     }
-    let val_ds = val_dirs
+    let mut val_ds = val_dirs
         .first()
         .map(|d| {
             if classify_mode {
@@ -338,6 +424,14 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             }
         })
         .transpose()?;
+
+    // cache="ram"：训练/验证集一次性预解码预缩（官方 load_image 语义）
+    if cfg.cache_ram {
+        train_ds.build_ram_cache(cfg.imgsz);
+        if let Some(v) = val_ds.as_mut() {
+            v.build_ram_cache(cfg.imgsz);
+        }
+    }
 
     let nc = model.nc;
     model.names = names.clone();
@@ -363,15 +457,16 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
     // 优化器（auto 语义）
     let iters_per_epoch = (train_ds.len() + cfg.batch - 1) / cfg.batch;
     let total_iters = iters_per_epoch * cfg.epochs;
-    let (opt_name, lr0, momentum) = if cfg.optimizer == "auto" {
+    let (opt_name, lr0, momentum, warmup_bias_lr) = if cfg.optimizer == "auto" {
         let lr_fit = ((0.002 * 5.0 / (4.0 + nc as f64) * 1e6).round() / 1e6).max(1e-6).min(0.01);
         if total_iters > 10000 {
-            ("SGD", cfg.lr0, cfg.momentum)
+            ("SGD", cfg.lr0, cfg.momentum, cfg.warmup_bias_lr)
         } else {
-            ("AdamW", lr_fit, 0.9)
+            // 官方 trainer.py：auto 选定 AdamW 时 warmup_bias_lr 强制 0
+            ("AdamW", lr_fit, 0.9, 0.0)
         }
     } else {
-        (cfg.optimizer.as_str(), cfg.lr0, cfg.momentum)
+        (cfg.optimizer.as_str(), cfg.lr0, cfg.momentum, cfg.warmup_bias_lr)
     };
     log::info!("optimizer={opt_name} lr0={lr0} momentum={momentum} iters/epoch={iters_per_epoch}");
 
@@ -381,9 +476,9 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
     let mut opt = ManualOptimizer::new(model, kind2, lr0, momentum, wd_eff);
     let accumulate = ((cfg.nbs.max(1) + cfg.batch - 1) / cfg.batch).max(1);
     log::info!("accumulate={accumulate} wd_eff={wd_eff:.6}");
-    let assigner = TaskAlignedAssigner { topk: 10, num_classes: nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    let assigner = TaskAlignedAssigner { topk: 10, topk2: 10, num_classes: nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
     // 官方 E2EDetectLoss：one2one 分支用 topk=1 的独立分配器
-    let assigner_o2o = TaskAlignedAssigner { topk: 1, num_classes: nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
+    let assigner_o2o = TaskAlignedAssigner { topk: 7, topk2: 1, num_classes: nc, alpha: 0.5, beta: 6.0, eps: 1e-9, stride_val: 16.0 };
     let lw = LossW::default();
     let mut ema = ModelEma::new(model);
     let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
@@ -430,29 +525,44 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
         };
 
         let load = |i: usize| train_ds.load(i).ok();
+        // AMP GradScaler 状态（官方 torch.cuda.amp.GradScaler 语义：init 65536、
+        // inf/nan → ×0.5 跳步、每 2000 成功步 ×2）
+        let use_amp = cfg.amp && matches!(cfg.device, tch::Device::Cuda(_));
+        let mut loss_scale = 65536f64;
+        let mut scaler_successive = 0usize;
+        // 官方 E2ELoss 分支增益：o2m 0.8→0.1 每 epoch 线性退火，o2o = 1 − o2m
+        let mut e2e_updates: i64 = 0;
+        let mut o2m_gain = 0.8f64;
+        let mut o2o_gain = 0.2f64;
         let mut epoch_loss = 0f64;
         let (mut ep_box, mut ep_cls, mut ep_dfl) = (0f64, 0f64, 0f64);
         let (mut ep_seg, mut ep_pose, mut ep_kobj, mut ep_ang) = (0f64, 0f64, 0f64, 0f64);
         let mut it = 0usize;
-        for chunk in order.chunks(cfg.batch) {
+        // cuDNN benchmark：固定输入尺寸下自动调优卷积算法（官方训练默认开启）
+        if matches!(cfg.device, tch::Device::Cuda(_)) {
+            tch::Cuda::cudnn_set_benchmark(true);
+        }
+        // 批预取管线：批 N+1 的增强在后台线程构建，与批 N 的 GPU 计算重叠
+        // （官方 DataLoader workers 的重叠语义）；multi-scale 逐批动态 bsz，关预取。
+        std::thread::scope(|scope| {
+        let chunks: Vec<&[usize]> = order.chunks(cfg.batch).collect();
+        let mut pending: Option<
+            std::thread::ScopedJoinHandle<'_, (Vec<Img>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<u8>>)>,
+        > = None;
+        for (ci, chunk) in chunks.iter().enumerate() {
             let ni = epoch * nb + it;
             // 本批输入尺寸（multi-scale：[0.5,1.5]×imgsz，32 对齐）
             let mut bsz = cfg.imgsz;
             if cfg.multi_scale {
-                let f = 0.5 + rng.clone().gen::<f64>();
-                let _ = f;
                 use rand::Rng as _;
-                let f: f64 = { let v: f64 = { let mut r2 = rng.clone(); r2.gen::<f64>() }; v };
-                let _ = &mut rng;
                 let scale = 0.5 + rng.gen::<f64>();
-                let _ = f;
                 bsz = ((cfg.imgsz as f64 * scale) / 32.0).round().max(1.0) as u32 * 32;
             }
             // warmup（官方三组：bias 从 warmup_bias_lr=0.1 → lr0；其余 0 → lr0；momentum 0.8 → 目标）
             if ni < nw {
                 let xn = (ni as f64) / nw as f64;
                 let lr_now = lr0 * xn;
-                let bias_lr = 0.1 + (lr0 - 0.1) * xn;
+                let bias_lr = warmup_bias_lr + (lr0 - warmup_bias_lr) * xn;
                 opt.set_lrs(bias_lr, lr_now);
                 let mom_now = 0.8 + (momentum - 0.8) * xn;
                 opt.set_momentum(mom_now);
@@ -468,43 +578,24 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                 opt.set_lrs(lr_now.max(1e-8), lr_now.max(1e-8));
             }
 
-            // 构建批（增强 + letterbox；seg/pose/obb 附带掩码/关键点/角度）
-            let mut imgs: Vec<Img> = Vec::with_capacity(chunk.len());
-            let mut labels: Vec<Vec<f32>> = Vec::new();
-            let mut kpts: Vec<Vec<f32>> = Vec::new();
-            let mut masks_v: Vec<Vec<u8>> = Vec::new();
-            for (bi, &idx) in chunk.iter().enumerate() {
-                let mut smp = augmentor.train_augment(idx, &load);
-                // 官方 erasing 仅 classify 管线（default 0.4）
-                if model.task == Task::Classify {
-                    let (a, b, c, d) = {
-                        use rand::Rng as _;
-                        let (a, b, c, d) = rng.gen::<(f32, f32, f32, f32)>();
-                        (a, b, c, d)
-                    };
-                    ul_data::augment::random_erasing(&mut smp, cfg.augment.erasing, a, b, c, d);
-                }
-                if smp.img.w != bsz || smp.img.h != bsz {
-                    smp.img = letterbox(&smp.img, bsz, [114, 114, 114]);
-                }
-                for ins in &smp.instances {
-                    if classify_mode {
-                        labels.push(vec![bi as f32, ins.cls as f32]);
-                        continue;
-                    }
-                    let mut row = vec![bi as f32, ins.cls as f32, ins.xywhn[0], ins.xywhn[1], ins.xywhn[2], ins.xywhn[3]];
-                    if ds_task == ul_data::dataset::TaskKind::Obb {
-                        row.push(ins.angle);
-                    }
-                    labels.push(row);
-                    if ds_task == ul_data::dataset::TaskKind::Pose {
-                        kpts.push(ins.kpts.clone());
-                    }
-                }
-                if ds_task == ul_data::dataset::TaskKind::Segment {
-                    masks_v.push(ul_data::augment::rasterize_mask(&smp, bsz));
-                }
-                imgs.push(smp.img);
+            // 批构建：优先取后台线程预取结果；未命中（首批/multi-scale）则同步构建。
+            // Augmentor 按 (epoch, index) 确定性播种，预取与同步结果逐位一致。
+            let classify_mode = model.task == Task::Classify;
+            let (imgs, labels, kpts, masks_v) = match pending.take() {
+                Some(h) => h.join().unwrap(),
+                None => build_train_batch(
+                    chunk, epoch, &augmentor, &load, bsz, classify_mode, ds_task, cfg.augment.erasing,
+                ),
+            };
+            // 启动下一批的后台构建（与本批 GPU 前向/反向重叠）
+            if !cfg.multi_scale && ci + 1 < chunks.len() {
+                let nxt: &[usize] = chunks[ci + 1];
+                let aug_ref = &augmentor;
+                let load_ref = &load;
+                let erasing = cfg.augment.erasing;
+                pending = Some(scope.spawn(move || {
+                    build_train_batch(nxt, epoch, aug_ref, load_ref, cfg.imgsz, classify_mode, ds_task, erasing)
+                }));
             }
             let img_t = to_tensor(&imgs, cfg.device);
             let ncol = if classify_mode {
@@ -541,6 +632,11 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             batch.kpts = kpts_t;
             batch.obb = ds_task == ul_data::dataset::TaskKind::Obb;
 
+            if std::env::var("UL_GRAD_TRACE").is_ok() {
+                let mx = f64::try_from(&batch.img.abs().max()).unwrap_or(f64::NAN);
+                eprintln!("[it] it={it} n={} samples={chunk:?} img_absmax={mx:.4}", chunk.len());
+            }
+
             // 前向 + 损失 + 反向
             match model.task {
                 Task::Classify => {
@@ -559,7 +655,7 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                         ModelOutput::Detect(h) => h,
                         _ => panic!("segment train expects detect head"),
                     };
-                    let det = v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e);
+                    let det = v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e, o2m_gain, o2o_gain);
                     let (rp, proto) = match &head_out {
                         ul_nn::head::HeadOutput::Train(rp) => (rp, rp.proto.as_ref().expect("segment requires proto")),
                         ul_nn::head::HeadOutput::TrainDual(a, _) => (a, a.proto.as_ref().expect("segment requires proto")),
@@ -582,7 +678,7 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                         ModelOutput::Detect(h) => h,
                         _ => panic!("pose train expects detect head"),
                     };
-                    let det = v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e);
+                    let det = v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e, o2m_gain, o2o_gain);
                     let rp = match &head_out {
                         ul_nn::head::HeadOutput::Train(rp) => rp,
                         ul_nn::head::HeadOutput::TrainDual(a, _) => a,
@@ -621,14 +717,27 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
                     ep_ang += parts.angle;
                 }
                 _ => {
-                    let out = model.forward(&batch.img, true).unwrap();
-                    let head_out = match out {
-                        ModelOutput::Detect(h) => h,
-                        _ => panic!("train only detect/classify for now"),
+                    // AMP：前向+损失包 autocast（conv/matmul fp16，BCE/log_softmax 由
+                    // autocast 策略自动提升 fp32，与官方 compute_loss 包裹语义一致）
+                    let use_amp = cfg.amp && matches!(cfg.device, tch::Device::Cuda(_));
+                    let compute = || {
+                        let out = model.forward(&batch.img, true).unwrap();
+                        let head_out = match out {
+                            ModelOutput::Detect(h) => h,
+                            _ => panic!("train only detect/classify for now"),
+                        };
+                        v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e, o2m_gain, o2o_gain)
                     };
-                    let det = v8_detection_loss(model, lw, &assigner, &assigner_o2o, &head_out, &batch, e2e);
-                    det.total.backward();
-                    epoch_loss += f64::try_from(&det.total).unwrap_or(0.0);
+                    let det = if use_amp { tch::autocast(true, compute) } else { compute() };
+                    // GradScaler：scaled loss 反传（步进阶段做 inf 检查与 unscale）
+                    if use_amp {
+                        (det.total.to_kind(Kind::Float) * loss_scale).backward();
+                    } else {
+                        det.total.backward();
+                    }
+                    // total = (三分量和)×bs；分量已在分支内单次 sync 取回，这里不再额外同步
+                    let bs = batch.batch_size as f64;
+                    epoch_loss += (det.parts.box_ + det.parts.cls + det.parts.dfl) * bs;
                     ep_box += det.parts.box_;
                     ep_cls += det.parts.cls;
                     ep_dfl += det.parts.dfl;
@@ -638,12 +747,93 @@ pub fn train(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<Train
             ema.update(model, epoch * nb + it);
             // nbs 梯度累积：每 accumulate 步（或 epoch 末）做一次 clip+step+zero
             if it % accumulate == 0 || it == nb {
-                opt.clip_grad(10.0);
-                opt.step();
+                // AMP GradScaler：inf/nan 检查（GPU 侧累计，仅一次 sync）→ 命中则
+                // scale ×0.5 并跳过本步；否则 unscale（grad /= scale）后再 clip+step
+                let mut skip_step = false;
+                if use_amp {
+                    let mut found = Tensor::zeros([1], (Kind::Float, cfg.device));
+                    for (_, t) in model.vs.variables() {
+                        if let Ok(g) = t.f_grad() {
+                            if g.defined() {
+                                let bad = g.isnan().to_kind(Kind::Float)
+                                    .sum_dim_intlist(None::<&[i64]>, false, Kind::Float)
+                                    + g.isinf().to_kind(Kind::Float)
+                                        .sum_dim_intlist(None::<&[i64]>, false, Kind::Float);
+                                found = &found + &bad;
+                            }
+                        }
+                    }
+                    if f64::try_from(&found).unwrap_or(1.0) > 0.0 {
+                        skip_step = true;
+                        loss_scale *= 0.5;
+                        scaler_successive = 0;
+                    } else {
+                        let inv =
+                            Tensor::from_slice(&[(1.0 / loss_scale) as f32]).to_device(cfg.device);
+                        tch::no_grad(|| {
+                            for (_, t) in model.vs.variables() {
+                                if let Ok(g) = t.f_grad() {
+                                    if g.defined() {
+                                        let mut gm = g.shallow_clone();
+                                        let _ = gm.f_mul_(&inv);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                if std::env::var("UL_GRAD_TRACE").is_ok() {
+                    let mut bad = 0usize;
+                    let mut first_bad = String::new();
+                    let mut gmax = 0f64;
+                    let mut wbad = 0usize;
+                    let mut first_wbad = String::new();
+                    for (name, t) in model.vs.variables() {
+                        let w = f64::try_from(&t.to_kind(tch::Kind::Float).abs().max()).unwrap_or(f64::NAN);
+                        if !w.is_finite() {
+                            wbad += 1;
+                            if first_wbad.is_empty() { first_wbad = name.clone(); }
+                        }
+                        if let Ok(g) = t.f_grad() {
+                            if g.defined() {
+                                let mx = f64::try_from(&g.abs().max()).unwrap_or(f64::NAN);
+                                if !mx.is_finite() {
+                                    bad += 1;
+                                    if first_bad.is_empty() { first_bad = name.clone(); }
+                                } else if mx > gmax {
+                                    gmax = mx;
+                                }
+                            }
+                        }
+                    }
+                    eprintln!("[grad] it={it} nonfinite_params={bad} first_bad={first_bad} finite_max_abs={gmax:.3} weight_nonfinite={wbad} first_wbad={first_wbad} scale={loss_scale:.0}");
+                }
+                if !skip_step {
+                    opt.clip_grad(10.0);
+                    opt.step();
+                    if use_amp {
+                        // scaler 步进成功：每 2000 步 ×2
+                        scaler_successive += 1;
+                        if scaler_successive >= 2000 {
+                            loss_scale *= 2.0;
+                            scaler_successive = 0;
+                        }
+                    }
+                }
                 opt.zero_grad();
             }
         }
+        });
+
         epochs_done = epoch + 1;
+
+        // 官方 trainer：每 epoch 末 criterion.update()——增益退火一步
+        if e2e {
+            e2e_updates += 1;
+            let denom = (cfg.epochs as f64 - 1.0).max(1.0);
+            o2m_gain = (1.0 - e2e_updates as f64 / denom).max(0.0) * 0.7 + 0.1;
+            o2o_gain = (1.0 - o2m_gain).max(0.0);
+        }
 
         // 验证
         let do_val = val_ds.is_some() && (epoch + 1) % cfg.val_interval.max(1) == 0;
@@ -766,10 +956,11 @@ fn train_classify(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<
                 ModelOutput::Classify(a, _) => a,
                 _ => panic!("classify expects classify head"),
             };
+            // 官方 v8ClassificationLoss：F.cross_entropy(reduction=mean)，无 label smoothing
             let loss = classification_loss(
                 &logits,
                 &Tensor::from_slice(&targets.iter().map(|x| *x as i64).collect::<Vec<_>>()).to_device(cfg.device),
-                0.1,
+                0.0,
             );
             loss.backward();
             ep_loss += f64::try_from(&loss).unwrap_or(0.0);
@@ -781,6 +972,7 @@ fn train_classify(model: &mut YoloModel, data: &Path, cfg: &TrainCfg) -> Result<
                 opt.zero_grad();
             }
         }
+
         epochs_done = epoch + 1;
         log::info!("epoch {}/{} cls_loss={:.4}", epoch + 1, cfg.epochs, ep_loss / it.max(1) as f64);
         let _ = metrics_log;
@@ -842,8 +1034,14 @@ pub fn validate_model(
             ModelOutput::Detect(ul_nn::head::HeadOutput::Inference(t)) => t,
             _ => return Err(UlError::Msg("val expects detect inference".into())),
         };
-        let t_t = t.transpose(1, 2).contiguous(); // (B, A, 4+nc)
-        let per_img = non_max_suppression_ex(&t_t, 4 + nc, &cfg, t_t.size()[0], t_t.size()[2], t_t.size()[1]);
+        let per_img = if model.end2end {
+            // E2E（yolo26/v10）：t 已是 (B, max_det, 6+extra) 最终检测，
+            // 直通解析——送通用 NMS 会把 [score,label] 列当类分数读且越界
+            crate::nms::parse_e2e_detections(&t, &cfg, t.size()[0])
+        } else {
+            let t_t = t.transpose(1, 2).contiguous(); // (B, A, 4+nc)
+            non_max_suppression_ex(&t_t, 4 + nc, &cfg, t_t.size()[0], t_t.size()[2], t_t.size()[1])
+        };
         for (bi, di) in per_img.iter().enumerate() {
             let (gain, _, pad_w, pad_h, ow, oh) = gains[bi];
             for d in &di.dets {
@@ -913,7 +1111,19 @@ pub fn load_checkpoint(stem: &Path, device: Device) -> Result<YoloModel, UlError
         serde_json::from_str(&std::fs::read_to_string(stem.join("meta.json"))?)?;
     let yaml_file = meta["yaml_file"].as_str().unwrap_or("yolo11n");
     let nc = meta["nc"].as_i64().unwrap_or(80);
-    let mut model = YoloModel::build(yaml_file, Some(nc), device, false)?;
+    // yaml_file 不带 scale 字符（如 models/26/yolo26.yaml）——用 meta.scale 拼出惯用名
+    // （yolo26.yaml + "n" → "yolo26n"），否则按文件名推断会默认错尺度（宽全错）
+    let scale = meta["scale"].as_str().unwrap_or("");
+    let yaml_stem =
+        std::path::Path::new(yaml_file).file_stem().and_then(|s| s.to_str()).unwrap_or(yaml_file);
+    let stem_has_scale =
+        matches!(yaml_stem.chars().last(), Some('n') | Some('s') | Some('m') | Some('l') | Some('x'));
+    let name = if !scale.is_empty() && !stem_has_scale {
+        format!("{yaml_stem}{scale}")
+    } else {
+        yaml_stem.to_string()
+    };
+    let mut model = YoloModel::build(&name, Some(nc), device, false)?;
     let sd = tch::Tensor::read_safetensors(&stem.join("weights.safetensors"))?;
     let map: std::collections::HashMap<String, Tensor> = sd.into_iter().collect();
     let vars = model.vs.variables();
@@ -951,18 +1161,34 @@ pub fn predict(
     if let Some(sd) = save_dir {
         std::fs::create_dir_all(sd)?;
     }
-    let mut out = Vec::new();
-    for src in sources {
-        let img = Img::open(src)?;
-        // rect：按长宽比 32 对齐矩形 letterbox
-        let (rw, rh) = crate::nms::rect_letterbox_size(img.w, img.h, imgsz, 32);
-        let lb = ul_data::augment::letterbox_rect(&img, rw, rh, [114, 114, 114]);
-        let x = to_tensor(&[lb], device);
-        let o = model.forward(&x, false)?;
-        let t = match o {
-            ModelOutput::Detect(ul_nn::head::HeadOutput::Inference(t)) => t,
-            ModelOutput::Classify(probs, _) => {
-                // 分类：top1
+    let classify_mode = matches!(model.task, Task::Classify);
+    let mut out = Vec::with_capacity(sources.len());
+
+    // 分块流水：rayon 并行解码/letterbox → 整批一次 GPU 前向 → 逐图后处理。
+    // 相比逐图串行：CPU 预处理 ×核数并行，GPU 前向按批摊销启动开销。
+    for src_chunk in sources.chunks(8) {
+        let pre: Vec<(PathBuf, Img, Img, ul_core::bbox::LetterboxParams)> = {
+            use rayon::prelude::*;
+            src_chunk
+                .par_iter()
+                .map(|src| {
+                    let img = Img::open(src)?;
+                    let (rw, rh) = crate::nms::rect_letterbox_size(img.w, img.h, imgsz, 32);
+                    let lb = ul_data::augment::letterbox_rect(&img, rw, rh, [114, 114, 114]);
+                    let p = ul_core::bbox::LetterboxParams::new(img.w as f32, img.h as f32, imgsz as f32, imgsz as f32);
+                    Ok((src.clone(), img, lb, p))
+                })
+                .collect::<Result<Vec<_>, UlError>>()?
+        };
+
+        if classify_mode {
+            for (src, img, lb, p) in &pre {
+                let x = to_tensor(std::slice::from_ref(lb), device);
+                let o = model.forward(&x, false)?;
+                let probs = match o {
+                    ModelOutput::Classify(probs, _) => probs,
+                    _ => return Err(UlError::Msg("predict expects detect/classify".into())),
+                };
                 let p: Vec<f32> = Vec::try_from(&probs.to_device(Device::Cpu).reshape([-1]))?;
                 let best = p
                     .iter()
@@ -970,39 +1196,60 @@ pub fn predict(
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|(i, v)| (i, *v))
                     .unwrap_or((0, 0.0));
-                let d = ul_core::nms::Det { xyxy: [0.0, 0.0, img.w as f32, img.h as f32], score: best.1, cls: best.0 as i64 };
+                let d = ul_core::nms::Det {
+                    xyxy: [0.0, 0.0, img.w as f32, img.h as f32],
+                    score: best.1,
+                    cls: best.0 as i64,
+                };
                 out.push(PredictOut { path: src.clone(), dets: vec![d] });
-                continue;
+                let _ = p;
             }
+            continue;
+        }
+
+        // detect：整批拼接一次前向
+        let lbs: Vec<Img> = pre.iter().map(|x| x.2.clone()).collect();
+        let x = to_tensor(&lbs, device);
+        let o = model.forward(&x, false)?;
+        let t = match o {
+            ModelOutput::Detect(ul_nn::head::HeadOutput::Inference(t)) => t,
             _ => return Err(UlError::Msg("predict expects detect/classify".into())),
         };
-        let t_t = t.transpose(1, 2).contiguous(); // (1, A, 4+nc)
-        let per = non_max_suppression_ex(&t_t, 4 + nc, &cfg, 1, t_t.size()[2], t_t.size()[1]);
-        let p = ul_core::bbox::LetterboxParams::new(img.w as f32, img.h as f32, imgsz as f32, imgsz as f32);
-        let mut dets: Vec<ul_core::nms::Det> = Vec::new();
-        for d in &per[0].dets {
-            let mut dd = *d;
-            scale_boxes_back(&mut dd, p.gain_w, p.pad_w, p.pad_h, img.w as f32, img.h as f32);
-            dets.push(dd);
-        }
-        if let Some(sd) = save_dir {
-            let mut vis = img.clone();
-            for d in &dets {
-                let c = ul_data::image::color_for(d.cls);
-                vis.rect(
-                    d.xyxy[0] as i32,
-                    d.xyxy[1] as i32,
-                    d.xyxy[2] as i32,
-                    d.xyxy[3] as i32,
-                    c,
-                    2,
-                );
+        let nb = t.size()[0];
+        let per = if model.end2end {
+            // E2E：t 已是 (B, max_det, 6+extra) 最终检测，直通解析（勿送通用 NMS）
+            crate::nms::parse_e2e_detections(&t, &cfg, nb)
+        } else {
+            let t_t = t.transpose(1, 2).contiguous(); // (B, A, 4+nc)
+            non_max_suppression_ex(&t_t, 4 + nc, &cfg, nb, t_t.size()[2], t_t.size()[1])
+        };
+
+        for (bi, (src, img, lb, p)) in pre.iter().enumerate() {
+            let di = &per[bi];
+            let mut dets: Vec<ul_core::nms::Det> = Vec::new();
+            for d in &di.dets {
+                let mut dd = *d;
+                scale_boxes_back(&mut dd, p.gain_w, p.pad_w, p.pad_h, img.w as f32, img.h as f32);
+                dets.push(dd);
             }
-            let out_name = src.file_name().map(|f| f.to_owned()).unwrap_or_default();
-            vis.save(&sd.join(out_name))?;
+            if let Some(sd) = save_dir {
+                let mut vis = img.clone();
+                for d in &dets {
+                    let c = ul_data::image::color_for(d.cls);
+                    vis.rect(
+                        d.xyxy[0] as i32,
+                        d.xyxy[1] as i32,
+                        d.xyxy[2] as i32,
+                        d.xyxy[3] as i32,
+                        c,
+                        2,
+                    );
+                }
+                let out_name = src.file_name().map(|f| f.to_owned()).unwrap_or_default();
+                vis.save(&sd.join(out_name))?;
+            }
+            out.push(PredictOut { path: src.clone(), dets });
         }
-        let _ = names;
-        out.push(PredictOut { path: src.clone(), dets });
     }
     Ok(out)
 }
@@ -1071,6 +1318,11 @@ fn validate_segment(model: &YoloModel, val: &YoloDataset, imgsz: u32, device: De
             ModelOutput::Detect(ul_nn::head::HeadOutput::Train(rp)) => {
                 let proto = rp.proto.as_ref().expect("seg proto").shallow_clone();
                 (rp, proto)
+            }
+            // yolo26 等端到端模型 train 前向返回双分支——掩码评估取 one2many 分支
+            ModelOutput::Detect(ul_nn::head::HeadOutput::TrainDual(a, _b)) => {
+                let proto = a.proto.as_ref().expect("seg proto").shallow_clone();
+                (a, proto)
             }
             _ => return Err(UlError::Msg("seg val expects train output".into())),
         };
@@ -1245,8 +1497,13 @@ fn validate_pose(model: &YoloModel, val: &YoloDataset, imgsz: u32, device: Devic
             ModelOutput::Detect(ul_nn::head::HeadOutput::Inference(t)) => t,
             _ => return Err(UlError::Msg("pose val expects inference".into())),
         };
-        let t_t = t.transpose(1, 2).contiguous(); // (1,A,4+nc+nk)
-        let per = non_max_suppression_ex(&t_t, 4 + nc, &cfg, 1, t_t.size()[2], t_t.size()[1]);
+        let per = if model.end2end {
+            // E2E：t 已是 (1, max_det, 4+2+nk) 最终检测（extras=解码后 kpts）
+            crate::nms::parse_e2e_detections(&t, &cfg, 1)
+        } else {
+            let t_t = t.transpose(1, 2).contiguous(); // (1,A,4+nc+nk)
+            non_max_suppression_ex(&t_t, 4 + nc, &cfg, 1, t_t.size()[2], t_t.size()[1])
+        };
         let di = &per[0];
         // GT
         let mut gts: Vec<(i64, [f32; 4], Vec<[f32; 3]>)> = Vec::new();
@@ -1332,8 +1589,13 @@ fn validate_obb(model: &YoloModel, val: &YoloDataset, imgsz: u32, device: Device
             ModelOutput::Detect(ul_nn::head::HeadOutput::Inference(t)) => t,
             _ => return Err(UlError::Msg("obb val expects inference".into())),
         };
-        let t_t = t.transpose(1, 2).contiguous(); // (1,A,4+nc+1)：xywh(像素)+cls+angle
-        let per = non_max_suppression_ex(&t_t, 4 + nc, &cfg, 1, t_t.size()[2], t_t.size()[1]);
+        let per = if model.end2end {
+            // E2E：t 已是 (1, max_det, 5+2) 最终检测（xywhr），直通解析
+            crate::nms::parse_e2e_detections_obb(&t, &cfg, 1)
+        } else {
+            let t_t = t.transpose(1, 2).contiguous(); // (1,A,4+nc+1)：xywh(像素)+cls+angle
+            non_max_suppression_ex(&t_t, 4 + nc, &cfg, 1, t_t.size()[2], t_t.size()[1])
+        };
         let di = &per[0];
         let mut gts: Vec<(i64, [f32; 5])> = Vec::new();
         for ins in &smp.instances {
