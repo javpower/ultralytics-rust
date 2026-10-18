@@ -19,7 +19,7 @@ jobs:
             lt_zip: https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.11.0%2Bcu128.zip
           - os: ubuntu-latest
             name: linux64
-            lt_zip: https://download.pytorch.org/libtorch/cu128/libtorch-cxx11-abi-shared-with-deps-2.11.0%2Bcu128.zip
+            lt_zip: https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.11.0%2Bcu128.zip
           - os: macos-latest
             name: mac-arm64
             lt_zip: https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.11.0.zip
@@ -49,8 +49,10 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/lt"
           curl -sL --retry 3 -o "$GITHUB_WORKSPACE/lt/lt.zip" "${{ matrix.lt_zip }}"
           tar -xf "$GITHUB_WORKSPACE/lt/lt.zip" -C "$GITHUB_WORKSPACE/lt"
-          # 官方包顶层可能是 libtorch/ 或带版本外目录——统一找含 include 的 libtorch 根
-          root=$(dirname "$(find "$GITHUB_WORKSPACE/lt" -type f -name "torch.h" -path "*include*" | head -1)")
+          # version.h 固定在 <libtorch>/include/torch/ 下——上溯三级即 libtorch 根
+          vh=$(find "$GITHUB_WORKSPACE/lt" -type f -path "*include/torch/version.h" | head -1)
+          [ -z "$vh" ] && { echo "libtorch root not found"; exit 1; }
+          root=$(dirname "$(dirname "$(dirname "$vh")")")
           echo "LIBTORCH=$root" >> "$GITHUB_ENV"
 
       - name: Build
