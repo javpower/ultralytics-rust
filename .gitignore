@@ -13,3 +13,4 @@ runs/
 bench_img/
 dist/
 deliver/
+lt_check/
