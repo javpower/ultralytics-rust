@@ -51,7 +51,11 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/lt"
           curl -sL --retry 3 -o "$GITHUB_WORKSPACE/lt/lt.zip" "${{ matrix.lt_zip }}"
-          tar -xf "$GITHUB_WORKSPACE/lt/lt.zip" -C "$GITHUB_WORKSPACE/lt"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            unzip -q "$GITHUB_WORKSPACE/lt/lt.zip" -d "$GITHUB_WORKSPACE/lt"
+          else
+            tar -xf "$GITHUB_WORKSPACE/lt/lt.zip" -C "$GITHUB_WORKSPACE/lt"
+          fi
           # 定位 libtorch 根：all.h 固定于 <root>/include/torch/csrc/api/include/torch/
           allh=$(find "$GITHUB_WORKSPACE/lt" -type f -path "*torch/csrc/api/include/torch/all.h" | head -1)
           [ -z "$allh" ] && { echo "libtorch root not found"; exit 1; }
