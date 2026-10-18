@@ -122,7 +122,7 @@ fn runtime_variant(has_gpu: bool) -> (&'static str, String) {
     match (std::env::consts::OS, std::env::consts::ARCH, has_gpu) {
         ("windows", _, true) => ("cu128", format!("libtorch-win-shared-with-deps-{VER}{plus}cu128.zip")),
         ("windows", _, false) => ("cpu", format!("libtorch-win-shared-with-deps-{VER}{plus}cpu.zip")),
-        ("linux", _, true) => ("cu128", format!("libtorch-cu128-{VER}{plus}cu128.zip")),
+        ("linux", _, true) => ("cu128", format!("libtorch-cxx11-abi-shared-with-deps-{VER}{plus}cu128.zip")),
         ("linux", _, false) => ("cpu", format!("libtorch-cpu-{VER}{plus}cpu.zip")),
         ("macos", "aarch64", _) => ("cpu", format!("libtorch-macos-arm64-{VER}.zip")),
         ("macos", _, _) => ("cpu", format!("libtorch-macos-x86_64-{VER}.zip")),

@@ -1,6 +1,6 @@
-# 三平台发布矩阵：tag 推送（如 v0.1.0）后自动构建 6 个产物
-#   yolo-launcher-{win,linux,mac}（启动器，小） + yolo-core-{win,linux,mac}（引擎）
-# 引擎链接 libtorch：CI 内按平台下载 2.11.0 运行时包后构建
+# 三平台发布矩阵：推 tag（如 v0.1.0）自动构建
+#   每平台产出 yolo-{win64,linux64,mac-arm64}.zip（yolo 启动器 + yolo_core 引擎）
+# 引擎链接 libtorch 2.11.0：CI 内按平台下载对应包后构建（tch 0.24 硬配对）
 name: release
 
 on:
@@ -16,43 +16,45 @@ jobs:
         include:
           - os: windows-latest
             name: win64
-            lt_url: https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.11.0%2Bcu128.zip
-            lt_dir: libtorch-win-shared-with-deps-2.11.0+cu128
-            exe: ""
+            lt_zip: https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.11.0%2Bcu128.zip
           - os: ubuntu-latest
             name: linux64
-            lt_url: https://download.pytorch.org/libtorch/cu128/libtorch-cu128-2.11.0%2Bcu128.zip
-            lt_dir: libtorch-cu128-2.11.0+cu128
-            exe: ""
+            lt_zip: https://download.pytorch.org/libtorch/cu128/libtorch-cxx11-abi-shared-with-deps-2.11.0%2Bcu128.zip
           - os: macos-latest
             name: mac-arm64
-            lt_url: https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.11.0.zip
-            lt_dir: libtorch
-            exe: ""
+            lt_zip: https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-2.11.0.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # libtorch 2.11.0 运行时下载解压（tch 0.24 硬配对）
-      - name: Download libtorch
+      - name: Download libtorch (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/libtorch-dl" | Out-Null
-          Invoke-WebRequest -Uri "${{ matrix.lt_url }}" -OutFile "$env:GITHUB_WORKSPACE/libtorch-dl/lt.zip"
-          if ("${{ runner.os }}" -eq "Windows") {
-            Expand-Archive -Path "$env:GITHUB_WORKSPACE/libtorch-dl/lt.zip" -DestinationPath "$env:GITHUB_WORKSPACE/libtorch-dl" -Force
-          } else {
-            tar -xf "$env:GITHUB_WORKSPACE/libtorch-dl/lt.zip" -C "$env:GITHUB_WORKSPACE/libtorch-dl"
-          }
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/lt" | Out-Null
+          Invoke-WebRequest -Uri "${{ matrix.lt_zip }}" -OutFile "$env:GITHUB_WORKSPACE/lt/lt.zip"
+          Expand-Archive -Path "$env:GITHUB_WORKSPACE/lt/lt.zip" -DestinationPath "$env:GITHUB_WORKSPACE/lt" -Force
+          # 定位含 include/torch 的 libtorch 根（zip 可能有一层外目录）
+          $root = Get-ChildItem "$env:GITHUB_WORKSPACE/lt" -Recurse -Directory -Filter "libtorch" |
+            Where-Object { Test-Path (Join-Path $_.FullName "include/torch") } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $root) { throw "libtorch root not found" }
+          "LIBTORCH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build launcher + engine
-        shell: pwsh
+      - name: Download libtorch (Linux/macOS)
+        if: runner.os != 'Windows'
         run: |
-          $lt = "$env:GITHUB_WORKSPACE/libtorch-dl/${{ matrix.lt_dir }}"
-          $env:LIBTORCH = $lt
-          $env:PATH = "$lt/bin;" + $env:PATH
+          mkdir -p "$GITHUB_WORKSPACE/lt"
+          curl -sL --retry 3 -o "$GITHUB_WORKSPACE/lt/lt.zip" "${{ matrix.lt_zip }}"
+          tar -xf "$GITHUB_WORKSPACE/lt/lt.zip" -C "$GITHUB_WORKSPACE/lt"
+          # 官方包顶层可能是 libtorch/ 或带版本外目录——统一找含 include 的 libtorch 根
+          root=$(dirname "$(find "$GITHUB_WORKSPACE/lt" -type f -name "torch.h" -path "*include*" | head -1)")
+          echo "LIBTORCH=$root" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
           cargo build --release -p ul-launcher
           cargo build --release -p ultralytics-rust
 
@@ -64,7 +66,7 @@ jobs:
           $suffix = if ("${{ runner.os }}" -eq "Windows") { ".exe" } else { "" }
           Copy-Item "target/release/yolo.exe"      "$dist/yolo$suffix"
           Copy-Item "target/release/yolo_core.exe" "$dist/yolo_core$suffix"
-          Compress-Archive -Path $dist/* -DestinationPath "$env:GITHUB_WORKSPACE/yolo-${{ matrix.name }}.zip" -Force
+          Compress-Archive -Path "$dist/*" -DestinationPath "${{ github.workspace }}/yolo-${{ matrix.name }}.zip" -Force
 
       - uses: actions/upload-artifact@v4
         with:
