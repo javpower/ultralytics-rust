@@ -36,11 +36,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/lt" | Out-Null
           Invoke-WebRequest -Uri "${{ matrix.lt_zip }}" -OutFile "$env:GITHUB_WORKSPACE/lt/lt.zip"
           Expand-Archive -Path "$env:GITHUB_WORKSPACE/lt/lt.zip" -DestinationPath "$env:GITHUB_WORKSPACE/lt" -Force
-          # 定位含 include/torch 的 libtorch 根（zip 可能有一层外目录）
-          $root = Get-ChildItem "$env:GITHUB_WORKSPACE/lt" -Recurse -Directory -Filter "libtorch" |
-            Where-Object { Test-Path (Join-Path $_.FullName "include/torch") } |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $root) { throw "libtorch root not found" }
+          # 定位 libtorch 根：all.h 固定于 <root>/include/torch/csrc/api/include/torch/
+          $allh = Get-ChildItem "$env:GITHUB_WORKSPACE/lt" -Recurse -File -Filter "all.h" |
+            Where-Object { $_.FullName -like "*include/torch/csrc/api/include/torch/all.h" } |
+            Select-Object -First 1
+          if (-not $allh) { throw "libtorch root not found" }
+          $root = $allh.DirectoryName -replace "include/torch/csrc/api/include/torch$", ""
+          $root = $root.TrimEnd("\", "/")
+          if (-not (Test-Path (Join-Path $root "include/torch/all.h"))) { throw "libtorch root verify failed: $root" }
           "LIBTORCH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Download libtorch (Linux/macOS)
@@ -49,10 +52,12 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/lt"
           curl -sL --retry 3 -o "$GITHUB_WORKSPACE/lt/lt.zip" "${{ matrix.lt_zip }}"
           tar -xf "$GITHUB_WORKSPACE/lt/lt.zip" -C "$GITHUB_WORKSPACE/lt"
-          # version.h 固定在 <libtorch>/include/torch/ 下——上溯三级即 libtorch 根
-          vh=$(find "$GITHUB_WORKSPACE/lt" -type f -path "*include/torch/version.h" | head -1)
-          [ -z "$vh" ] && { echo "libtorch root not found"; exit 1; }
-          root=$(dirname "$(dirname "$(dirname "$vh")")")
+          # 定位 libtorch 根：all.h 固定于 <root>/include/torch/csrc/api/include/torch/
+          allh=$(find "$GITHUB_WORKSPACE/lt" -type f -path "*torch/csrc/api/include/torch/all.h" | head -1)
+          [ -z "$allh" ] && { echo "libtorch root not found"; exit 1; }
+          root=${allh%include/torch/csrc/api/include/torch/all.h}
+          root=${root%/}
+          [ -f "$root/include/torch/all.h" ] || { echo "libtorch root verify failed: $root"; exit 1; }
           echo "LIBTORCH=$root" >> "$GITHUB_ENV"
 
       - name: Build
