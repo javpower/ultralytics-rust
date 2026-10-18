@@ -34,7 +34,15 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/lt" | Out-Null
-          Invoke-WebRequest -Uri "${{ matrix.lt_zip }}" -OutFile "$env:GITHUB_WORKSPACE/lt/lt.zip"
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            Write-Host "下载尝试 $i/5"
+            try {
+              Invoke-WebRequest -Uri "${{ matrix.lt_zip }}" -OutFile "$env:GITHUB_WORKSPACE/lt/lt.zip" -MaximumRedirection 5
+              $ok = $true; break
+            } catch { Write-Host $_.Exception.Message; Start-Sleep -Seconds (15 * $i) }
+          }
+          if (-not $ok) { throw "libtorch 下载失败（重试 5 次）" }
           Expand-Archive -Path "$env:GITHUB_WORKSPACE/lt/lt.zip" -DestinationPath "$env:GITHUB_WORKSPACE/lt" -Force
           # 定位 libtorch 根：all.h 固定于 <root>/include/torch/csrc/api/include/torch/
           $allh = Get-ChildItem "$env:GITHUB_WORKSPACE/lt" -Recurse -File -Filter "all.h" |
@@ -50,7 +58,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p "$GITHUB_WORKSPACE/lt"
-          curl -sL --retry 3 -o "$GITHUB_WORKSPACE/lt/lt.zip" "${{ matrix.lt_zip }}"
+          curl -sL --retry 5 --retry-delay 15 --retry-all-errors -o "$GITHUB_WORKSPACE/lt/lt.zip" "${{ matrix.lt_zip }}"
           if [ "${{ runner.os }}" = "Linux" ]; then
             unzip -q "$GITHUB_WORKSPACE/lt/lt.zip" -d "$GITHUB_WORKSPACE/lt"
           else
